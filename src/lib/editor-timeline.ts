@@ -173,3 +173,44 @@ export function canRemoveTrack<T extends { id: string; default?: boolean }>(trac
   if (!track || track.default) return false;
   return !clips.some((clip) => clip.trackId === trackId);
 }
+const OVERLAP_EPSILON = 1e-6;
+
+/** Moves a clip's start to the nearest spot on its row where it does not cover any other clip. */
+export function nearestFreeStart(candidate: number, duration: number, others: TimelineRange[]) {
+  const sorted = [...others].sort((a, b) => a.start - b.start);
+  const gaps: { from: number; to: number }[] = [];
+  let cursor = 0;
+  for (const clip of sorted) {
+    if (clip.start > cursor) gaps.push({ from: cursor, to: clip.start });
+    cursor = Math.max(cursor, clip.start + clip.duration);
+  }
+  gaps.push({ from: cursor, to: Number.POSITIVE_INFINITY });
+  const wanted = Math.max(0, candidate);
+  let best = cursor;
+  let bestDistance = Number.POSITIVE_INFINITY;
+  for (const gap of gaps) {
+    if (gap.to - gap.from + OVERLAP_EPSILON < duration) continue;
+    const placed = Math.min(Math.max(wanted, gap.from), gap.to - duration);
+    const distance = Math.abs(placed - wanted);
+    if (distance < bestDistance) {
+      best = placed;
+      bestDistance = distance;
+    }
+  }
+  return best;
+}
+
+/** Trims a clip without letting either edge cross into a neighbouring clip on the same row. */
+export function trimClipWithin(clip: TrimmableClip, edge: TrimEdge, delta: number, others: TimelineRange[]): TrimmedClip {
+  const end = clip.start + clip.duration;
+  if (edge === "left") {
+    const previousEnd = others
+      .filter((other) => other.start + other.duration <= clip.start + OVERLAP_EPSILON)
+      .reduce((latest, other) => Math.max(latest, other.start + other.duration), 0);
+    return trimClip(clip, edge, Math.max(delta, previousEnd - clip.start));
+  }
+  const nextStart = others
+    .filter((other) => other.start >= end - OVERLAP_EPSILON)
+    .reduce((earliest, other) => Math.min(earliest, other.start), Number.POSITIVE_INFINITY);
+  return trimClip(clip, edge, Math.min(delta, nextStart - end));
+}

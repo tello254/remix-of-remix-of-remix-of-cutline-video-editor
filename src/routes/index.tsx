@@ -52,7 +52,8 @@ import {
   trackInsertionIndex,
   transitionFrameStyle,
   transitionLayersAtTime,
-  trimClip,
+  trimClipWithin,
+  nearestFreeStart,
   type TrimEdge,
 } from "@/lib/editor-timeline";
 
@@ -183,6 +184,11 @@ function Editor() {
     (clip) => clip.kind === "visual" && isTimelineRangeActive(clip, playhead),
   );
 
+  const rowNeighbours = useCallback(
+    (trackId: string, excludeId?: string) => projectRef.current.clips.filter((clip) => clip.trackId === trackId && clip.id !== excludeId),
+    [],
+  );
+
   const snapStart = useCallback(
     (candidate: number, clipId: string, trackId: string) => {
       const boundaries = [0];
@@ -205,7 +211,8 @@ function Editor() {
       const state = projectRef.current;
       const matchingTrack = compatibleTrackId(state.tracks, item.kind, item.mediaType, trackId);
       if (!matchingTrack) return;
-      const position = at ?? Math.max(0, ...state.clips.filter((clip) => clip.trackId === matchingTrack).map((clip) => clip.start + clip.duration));
+      const rowClips = state.clips.filter((clip) => clip.trackId === matchingTrack);
+      const position = nearestFreeStart(at ?? Math.max(0, ...rowClips.map((clip) => clip.start + clip.duration)), item.duration, rowClips);
       const clip: Clip = { ...item, id: makeId(), trackId: matchingTrack, start: position };
       commitProject((current) => ({ ...current, clips: [...current.clips, clip] }));
       setSelectedId(clip.id);
@@ -333,10 +340,10 @@ function Editor() {
 
   const duplicateSelected = useCallback(() => {
     if (!selectedClip) return;
-    const duplicate = { ...selectedClip, id: makeId(), start: selectedClip.start + selectedClip.duration + 0.25 };
+    const duplicate = { ...selectedClip, id: makeId(), start: nearestFreeStart(selectedClip.start + selectedClip.duration, selectedClip.duration, rowNeighbours(selectedClip.trackId)) };
     commitProject((current) => ({ ...current, clips: [...current.clips, duplicate] }));
     setSelectedId(duplicate.id);
-  }, [commitProject, selectedClip]);
+  }, [commitProject, rowNeighbours, selectedClip]);
 
   const splitSelected = useCallback(() => {
     if (!selectedClip) return;
@@ -364,10 +371,10 @@ function Editor() {
 
   const pasteClip = useCallback(() => {
     if (!copiedClip) return;
-    const clip = { ...copiedClip, id: makeId(), start: snapStart(playhead, copiedClip.id, copiedClip.trackId) };
+    const clip = { ...copiedClip, id: makeId(), start: nearestFreeStart(snapStart(playhead, copiedClip.id, copiedClip.trackId), copiedClip.duration, rowNeighbours(copiedClip.trackId)) };
     commitProject((current) => ({ ...current, clips: [...current.clips, clip] }));
     setSelectedId(clip.id);
-  }, [commitProject, copiedClip, playhead, snapStart]);
+  }, [commitProject, copiedClip, playhead, rowNeighbours, snapStart]);
 
   const beginRecording = useCallback(async () => {
     try {
@@ -504,7 +511,7 @@ function Editor() {
       const targetTrackId = target?.dataset["trackId"];
       const track = projectRef.current.tracks.find((item) => item.id === targetTrackId && isTrackCompatible(item, clip.mediaType));
       const nextTrackId = track?.id ?? drag.trackId;
-      setDrag({ ...drag, nextStart: snapStart(raw, clip.id, nextTrackId), nextTrackId });
+      setDrag({ ...drag, nextStart: nearestFreeStart(snapStart(raw, clip.id, nextTrackId), clip.duration, rowNeighbours(nextTrackId, clip.id)), nextTrackId });
     };
     const onUp = () => {
       if (drag.nextStart !== drag.originalStart || drag.nextTrackId !== drag.trackId) {
@@ -521,7 +528,7 @@ function Editor() {
       window.removeEventListener("pointermove", onMove);
       window.removeEventListener("pointerup", onUp);
     };
-  }, [commitProject, drag, snapStart, zoom]);
+  }, [commitProject, drag, rowNeighbours, snapStart, zoom]);
 
   useEffect(() => {
     if (!trimDrag) return;
@@ -529,7 +536,7 @@ function Editor() {
       setTrimDrag({ ...trimDrag, delta: (event.clientX - trimDrag.startX) / zoom });
     };
     const onUp = () => {
-      const trimmed = trimClip(trimDrag.original, trimDrag.edge, trimDrag.delta);
+      const trimmed = trimClipWithin(trimDrag.original, trimDrag.edge, trimDrag.delta, rowNeighbours(trimDrag.original.trackId, trimDrag.clipId));
       if (trimmed.start !== trimDrag.original.start || trimmed.duration !== trimDrag.original.duration || trimmed.sourceOffset !== trimDrag.original.sourceOffset) {
         commitProject((current) => ({
           ...current,
@@ -546,7 +553,7 @@ function Editor() {
       window.removeEventListener("pointermove", onMove);
       window.removeEventListener("pointerup", onUp);
     };
-  }, [commitProject, trimDrag, zoom]);
+  }, [commitProject, rowNeighbours, trimDrag, zoom]);
 
   useEffect(() => () => {
     recordingStream.current?.getTracks().forEach((track) => track.stop());
@@ -595,7 +602,7 @@ function Editor() {
 
   const clipWindow = (clip: Clip) => {
     if (trimDrag?.clipId === clip.id) {
-      const trimmed = trimClip(trimDrag.original, trimDrag.edge, trimDrag.delta);
+      const trimmed = trimClipWithin(trimDrag.original, trimDrag.edge, trimDrag.delta, rowNeighbours(trimDrag.original.trackId, trimDrag.clipId));
       return { start: trimmed.start, duration: trimmed.duration };
     }
     if (drag?.clipId === clip.id) return { start: drag.nextStart, duration: clip.duration };
