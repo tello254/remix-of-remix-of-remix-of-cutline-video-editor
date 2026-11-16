@@ -276,16 +276,16 @@
 .zoom-actions > span { width: 34px; text-align: center; font-variant-numeric: tabular-nums; }
 .timeline-body { min-height: 0; flex: 1; display: flex; overflow: hidden; }
 .timeline-grid { display: flex; width: max-content; min-width: 100%; min-height: 100%; }
-.track-rail { position: sticky; left: 0; z-index: 8; width: 146px; flex: 0 0 146px; display: flex; flex-direction: column; background: var(--editor-rail); border-right: 1px solid var(--editor-separator); }
+.track-rail { position: sticky; left: 0; z-index: 12; width: 146px; flex: 0 0 146px; display: flex; flex-direction: column; background: var(--editor-rail); border-right: 1px solid var(--editor-separator); }
 .rail-ruler, .timeline-ruler { height: 28px; border-bottom: 1px solid var(--editor-separator); }
-.rail-ruler { position: sticky; top: 0; z-index: 9; background: var(--editor-rail); display: flex; align-items: center; padding-left: 14px; color: var(--muted-foreground); font-size: 9px; font-variant-numeric: tabular-nums; }
+.rail-ruler { position: sticky; top: 0; z-index: 13; background: var(--editor-rail); display: flex; align-items: center; padding-left: 14px; color: var(--muted-foreground); font-size: 9px; font-variant-numeric: tabular-nums; }
 .track-label { height: 44px; display: flex; align-items: center; gap: 7px; padding: 0 11px; border-bottom: 1px solid var(--editor-separator); }
 .track-type-icon { display: grid; place-items: center; color: var(--editor-video); }
 .track-label.voice .track-type-icon { color: var(--editor-voice); }
 .track-label.audio .track-type-icon { color: var(--editor-audio); }
 .track-name { overflow: hidden; flex: 1; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
 .track-kind-label { color: var(--muted-foreground); font-size: 7px; letter-spacing: .06em; }
-.timeline-scroll { min-width: 0; flex: 1; overflow: auto; scrollbar-color: var(--editor-soft) var(--editor-rail); scrollbar-width: thin; }
+.timeline-scroll { min-width: 0; flex: 1; overflow: auto; touch-action: none; overscroll-behavior: contain; scrollbar-color: var(--editor-soft) var(--editor-rail); scrollbar-width: thin; }
 .timeline-content { flex: 0 0 auto; min-height: 100%; position: relative; }
 .timeline-ruler { position: sticky; top: 0; z-index: 5; background-color: var(--editor-rail); background-image: linear-gradient(to right, transparent calc(100% - 1px), var(--editor-separator) calc(100% - 1px)); background-size: 360px 100%; cursor: crosshair; }
 .ruler-tick { position: absolute; top: 0; height: 7px; border-left: 1px solid var(--editor-soft); }
