@@ -138,17 +138,18 @@ export function compatibleTrackId<T extends TrackLike>(
     ?? tracks.find(accepts)?.id;
 }
 
-export function trackInsertionIndex<T extends TrackLike>(tracks: T[], category: T["category"], afterTrackId?: string) {
-  if (afterTrackId) {
-    const index = tracks.findIndex((track) => track.id === afterTrackId);
-    if (index !== -1) return index + 1;
+/**
+ * Rows are displayed in reverse array order (last track on top), so inserting at the
+ * clicked row's own index places the new row directly BELOW it on screen.
+ */
+export function trackInsertionIndex<T extends TrackLike>(tracks: T[], category: T["category"], belowTrackId?: string) {
+  if (belowTrackId) {
+    const index = tracks.findIndex((track) => track.id === belowTrackId);
+    if (index !== -1) return index;
   }
 
-  let lastInCategory = -1;
-  tracks.forEach((track, index) => {
-    if (track.category === category) lastInCategory = index;
-  });
-  if (lastInCategory !== -1) return lastInCategory + 1;
+  const firstInCategory = tracks.findIndex((track) => track.category === category);
+  if (firstInCategory !== -1) return firstInCategory;
 
   const order: TrackLike["category"][] = ["video", "image", "voice", "music"];
   const categoryRank = order.indexOf(category);

@@ -96,8 +96,22 @@ describe("timeline behavior", () => {
     ];
     expect(trackInsertionIndex(tracks, "video")).toBe(0);
     expect(trackInsertionIndex(tracks, "image")).toBe(1);
-    expect(trackInsertionIndex(tracks, "voice", "video-1")).toBe(1);
+    expect(trackInsertionIndex(tracks, "image", "image-1")).toBe(1);
     expect(nextTrackName([...tracks, { id: "video-2", kind: "visual" as const, category: "video" as const, name: "Video 2" }], "video")).toBe("Video 3");
+  });
+
+  it("adds a same-type row directly below the clicked row on screen, keeping groups together", () => {
+    const tracks = [
+      { id: "video-1", kind: "visual" as const, category: "video" as const, name: "Video 1" },
+      { id: "image-1", kind: "visual" as const, category: "image" as const, name: "Image 1" },
+      { id: "image-2", kind: "visual" as const, category: "image" as const, name: "Image 2" },
+      { id: "voice-1", kind: "voice" as const, category: "voice" as const, name: "Voice 1" },
+    ];
+    const added = { id: "image-3", kind: "visual" as const, category: "image" as const, name: "Image 3" };
+    const index = trackInsertionIndex(tracks, "image", "image-2");
+    const next = [...tracks.slice(0, index), added, ...tracks.slice(index)];
+    const onScreen = [...next].reverse().map((track) => track.id);
+    expect(onScreen).toEqual(["voice-1", "image-2", "image-3", "image-1", "video-1"]);
   });
 
   it("allows removing only existing tracks with no clips", () => {
