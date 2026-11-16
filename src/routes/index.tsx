@@ -137,9 +137,10 @@ function Editor() {
   const [dropTarget, setDropTarget] = useState<DropTarget | null>(null);
   const [libraryOpen, setLibraryOpen] = useState(false);
   const timelineRef = useRef<HTMLDivElement>(null);
-  // Single drag scrubs the playhead; a double tap followed by a drag pans the timeline.
+  // Single swipe pans the timeline and a single tap selects a clip; a double tap (then drag)
+  // moves the playhead, or picks up the clip under the finger so it can be moved.
   const lastTimelineTap = useRef<{ time: number; x: number; y: number } | null>(null);
-  const timelineGesture = useRef<{ mode: "scrub" | "pan"; pointerId: number; startX: number; startY: number; startLeft: number; startTop: number } | null>(null);
+  const timelineGesture = useRef<{ mode: "scrub" | "pan"; pointerId: number; startX: number; startY: number; startLeft: number; startTop: number; clipId?: string; moved: boolean } | null>(null);
   const videoRefs = useRef(new Map<string, HTMLVideoElement>());
   const audioRefs = useRef(new Map<string, HTMLAudioElement>());
   const recorderRef = useRef<MediaRecorder | null>(null);
@@ -622,17 +623,21 @@ function Editor() {
   const beginTimelineGesture = (event: ReactPointerEvent<HTMLDivElement>) => {
     if (event.button !== 0) return;
     const target = event.target as HTMLElement;
-    if (target.closest(".clip-block, .transition-chip, .track-rail, button")) return;
-    const now = performance.now();
+    if (target.closest(".transition-chip, .track-rail, .trim-handle, button")) return;
+    const clipId = target.closest<HTMLElement>("[data-clip-id]")?.dataset["clipId"];
     const last = lastTimelineTap.current;
-    const isDoubleTap = !!last && now - last.time < 350 && Math.hypot(event.clientX - last.x, event.clientY - last.y) < 32;
-    lastTimelineTap.current = isDoubleTap ? null : { time: now, x: event.clientX, y: event.clientY };
+    const isDoubleTap = !!last && performance.now() - last.time < 350 && Math.hypot(event.clientX - last.x, event.clientY - last.y) < 32;
+    lastTimelineTap.current = null;
+    if (isDoubleTap && clipId) {
+      const clip = projectRef.current.clips.find((item) => item.id === clipId);
+      if (clip) beginDrag(event, clip);
+      return;
+    }
     const viewport = event.currentTarget;
-    timelineGesture.current = { mode: isDoubleTap ? "pan" : "scrub", pointerId: event.pointerId, startX: event.clientX, startY: event.clientY, startLeft: viewport.scrollLeft, startTop: viewport.scrollTop };
+    timelineGesture.current = { mode: isDoubleTap ? "scrub" : "pan", pointerId: event.pointerId, startX: event.clientX, startY: event.clientY, startLeft: viewport.scrollLeft, startTop: viewport.scrollTop, clipId, moved: false };
     viewport.setPointerCapture(event.pointerId);
-    if (!isDoubleTap) {
+    if (isDoubleTap) {
       setIsPlaying(false);
-      setSelectedId(null);
       scrubTo(event.clientX);
     }
   };
@@ -640,6 +645,7 @@ function Editor() {
   const moveTimelineGesture = (event: ReactPointerEvent<HTMLDivElement>) => {
     const gesture = timelineGesture.current;
     if (!gesture || gesture.pointerId !== event.pointerId) return;
+    if (Math.hypot(event.clientX - gesture.startX, event.clientY - gesture.startY) > 6) gesture.moved = true;
     if (gesture.mode === "pan") {
       event.currentTarget.scrollLeft = gesture.startLeft - (event.clientX - gesture.startX);
       event.currentTarget.scrollTop = gesture.startTop - (event.clientY - gesture.startY);
@@ -649,9 +655,15 @@ function Editor() {
   };
 
   const endTimelineGesture = (event: ReactPointerEvent<HTMLDivElement>) => {
-    if (timelineGesture.current?.pointerId !== event.pointerId) return;
+    const gesture = timelineGesture.current;
+    if (gesture?.pointerId !== event.pointerId) return;
     timelineGesture.current = null;
     if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
+    if (gesture.mode !== "pan" || gesture.moved || event.type === "pointercancel") return;
+    // A single tap: select the clip under it (or clear the selection) and arm a double tap.
+    setSelectedId(gesture.clipId ?? null);
+    setSelectedTransition(null);
+    lastTimelineTap.current = { time: performance.now(), x: event.clientX, y: event.clientY };
   };
 
   const beginDrag = (event: ReactPointerEvent<HTMLDivElement>, clip: Clip) => {
@@ -768,7 +780,7 @@ function Editor() {
                     if (isDragged && drag.nextTrackId !== track.id) return null;
                     const geometry = clipWindow(clip);
                     const isTrimming = trimDrag?.clipId === clip.id;
-                    return <div key={clip.id} className={`clip-block ${clip.kind} ${clip.mediaType} ${selectedId === clip.id ? "selected" : ""} ${isDragged ? "dragging" : ""} ${isTrimming ? "trimming" : ""}`} style={{ left: `${geometry.start * zoom}px`, width: `${geometry.duration * zoom}px` }} onPointerDown={(event) => beginDrag(event, clip)} onClick={(event) => { event.stopPropagation(); setSelectedId(clip.id); setSelectedTransition(null); }} title={`${clip.name} · ${geometry.duration.toFixed(2)} sec`}><span className="clip-thumb">{clip.mediaType === "image" ? <ImageIcon size={13} /> : clip.mediaType === "video" ? <Video size={13} /> : <AudioLines size={13} />}</span><span className="clip-label">{clip.name}</span>{clip.mediaType !== "image" && <span className="clip-duration">{geometry.duration.toFixed(1)}s</span>}{clip.mediaType === "audio" && <span className="waveform" aria-hidden="true">{Array.from({ length: 32 }, (_, index) => <i key={index} style={{ height: `${14 + ((index * 17 + clip.id.charCodeAt(0)) % 72)}%` }} />)}</span>}{selectedId === clip.id && <><span className={`trim-handle left ${isTrimming && trimDrag.edge === "left" ? "active" : ""}`} onPointerDown={(event) => beginTrim(event, clip, "left")} /><span className={`trim-handle right ${isTrimming && trimDrag.edge === "right" ? "active" : ""}`} onPointerDown={(event) => beginTrim(event, clip, "right")} /></>}</div>;
+                    return <div key={clip.id} className={`clip-block ${clip.kind} ${clip.mediaType} ${selectedId === clip.id ? "selected" : ""} ${isDragged ? "dragging" : ""} ${isTrimming ? "trimming" : ""}`} style={{ left: `${geometry.start * zoom}px`, width: `${geometry.duration * zoom}px` }} data-clip-id={clip.id} title={`${clip.name} · ${geometry.duration.toFixed(2)} sec`}><span className="clip-thumb">{clip.mediaType === "image" ? <ImageIcon size={13} /> : clip.mediaType === "video" ? <Video size={13} /> : <AudioLines size={13} />}</span><span className="clip-label">{clip.name}</span>{clip.mediaType !== "image" && <span className="clip-duration">{geometry.duration.toFixed(1)}s</span>}{clip.mediaType === "audio" && <span className="waveform" aria-hidden="true">{Array.from({ length: 32 }, (_, index) => <i key={index} style={{ height: `${14 + ((index * 17 + clip.id.charCodeAt(0)) % 72)}%` }} />)}</span>}{selectedId === clip.id && <><span className={`trim-handle left ${isTrimming && trimDrag.edge === "left" ? "active" : ""}`} onPointerDown={(event) => beginTrim(event, clip, "left")} /><span className={`trim-handle right ${isTrimming && trimDrag.edge === "right" ? "active" : ""}`} onPointerDown={(event) => beginTrim(event, clip, "right")} /></>}</div>;
                   })}
                   {ordered.slice(0, -1).map((left) => {
                     const right = ordered.find((clip) => clip.start >= left.start + left.duration - 0.04 && clip.id !== left.id);
