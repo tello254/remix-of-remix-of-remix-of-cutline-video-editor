@@ -140,7 +140,7 @@ function Editor() {
   // Single swipe pans the timeline and a single tap selects a clip; a double tap (then drag)
   // moves the playhead, or picks up the clip under the finger so it can be moved.
   const lastTimelineTap = useRef<{ time: number; x: number; y: number } | null>(null);
-  const timelineGesture = useRef<{ mode: "scrub" | "pan"; pointerId: number; startX: number; startY: number; startLeft: number; startTop: number; clipId?: string; moved: boolean } | null>(null);
+  const timelineGesture = useRef<{ mode: "scrub" | "pan"; pointerId: number; startX: number; startY: number; startLeft: number; startTop: number; clipId: string | undefined; moved: boolean } | null>(null);
   const videoRefs = useRef(new Map<string, HTMLVideoElement>());
   const audioRefs = useRef(new Map<string, HTMLAudioElement>());
   const recorderRef = useRef<MediaRecorder | null>(null);
