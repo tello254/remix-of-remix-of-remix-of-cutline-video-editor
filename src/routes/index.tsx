@@ -99,8 +99,6 @@ const STARTER_TRACKS: Track[] = [
   { id: "audio-1", kind: "audio", category: "music", name: "Music 1" },
 ];
 const TRACK_RAIL_WIDTH = 146;
-const CATEGORY_LABELS: Record<TrackCategory, string> = { video: "Video", image: "Image", voice: "Voice", music: "Music" };
-const TRACK_CATEGORIES: TrackCategory[] = ["video", "image", "voice", "music"];
 
 function formatTime(seconds: number) {
   const safe = Math.max(0, seconds);
