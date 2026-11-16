@@ -99,6 +99,8 @@ const STARTER_TRACKS: Track[] = [
   { id: "audio-1", kind: "audio", category: "music", name: "Music 1", default: true },
 ];
 const TRACK_RAIL_WIDTH = 146;
+// The label column narrows on phones, so pointer math reads its rendered width.
+const railWidth = (viewport: HTMLElement) => viewport.querySelector<HTMLElement>(".track-rail")?.offsetWidth ?? TRACK_RAIL_WIDTH;
 
 function formatTime(seconds: number) {
   const safe = Math.max(0, seconds);
@@ -134,6 +136,9 @@ function Editor() {
   const [dropTarget, setDropTarget] = useState<DropTarget | null>(null);
   const [libraryOpen, setLibraryOpen] = useState(false);
   const timelineRef = useRef<HTMLDivElement>(null);
+  // Single drag scrubs the playhead; a double tap followed by a drag pans the timeline.
+  const lastTimelineTap = useRef<{ time: number; x: number; y: number } | null>(null);
+  const timelineGesture = useRef<{ mode: "scrub" | "pan"; pointerId: number; startX: number; startY: number; startLeft: number; startTop: number } | null>(null);
   const videoRefs = useRef(new Map<string, HTMLVideoElement>());
   const audioRefs = useRef(new Map<string, HTMLAudioElement>());
   const recorderRef = useRef<MediaRecorder | null>(null);
@@ -292,7 +297,7 @@ function Editor() {
   const timelineDropTime = useCallback((clientX: number) => {
     const viewport = timelineRef.current;
     if (!viewport) return playhead;
-    return timelineTimeAtPointer(clientX, viewport.getBoundingClientRect().left + TRACK_RAIL_WIDTH, viewport.scrollLeft, zoom);
+    return timelineTimeAtPointer(clientX, viewport.getBoundingClientRect().left + railWidth(viewport), viewport.scrollLeft, zoom);
   }, [playhead, zoom]);
 
   const addTrack = useCallback((category: TrackCategory, belowTrackId?: string) => {
@@ -601,6 +606,47 @@ function Editor() {
   const contentWidth = Math.max(1100, timelineWidth(totalDuration, zoom));
   const selectedTransitionData = project.transitions.find((item) => item.id === selectedTransition);
 
+  const scrubTo = (clientX: number) => {
+    const viewport = timelineRef.current;
+    if (!viewport) return;
+    setPlayhead(Math.max(0, timelineTimeAtPointer(clientX, viewport.getBoundingClientRect().left + railWidth(viewport), viewport.scrollLeft, zoom)));
+  };
+
+  const beginTimelineGesture = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (event.button !== 0) return;
+    const target = event.target as HTMLElement;
+    if (target.closest(".clip-block, .transition-chip, .track-rail, button")) return;
+    const now = performance.now();
+    const last = lastTimelineTap.current;
+    const isDoubleTap = !!last && now - last.time < 350 && Math.hypot(event.clientX - last.x, event.clientY - last.y) < 32;
+    lastTimelineTap.current = isDoubleTap ? null : { time: now, x: event.clientX, y: event.clientY };
+    const viewport = event.currentTarget;
+    timelineGesture.current = { mode: isDoubleTap ? "pan" : "scrub", pointerId: event.pointerId, startX: event.clientX, startY: event.clientY, startLeft: viewport.scrollLeft, startTop: viewport.scrollTop };
+    viewport.setPointerCapture(event.pointerId);
+    if (!isDoubleTap) {
+      setIsPlaying(false);
+      setSelectedId(null);
+      scrubTo(event.clientX);
+    }
+  };
+
+  const moveTimelineGesture = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const gesture = timelineGesture.current;
+    if (!gesture || gesture.pointerId !== event.pointerId) return;
+    if (gesture.mode === "pan") {
+      event.currentTarget.scrollLeft = gesture.startLeft - (event.clientX - gesture.startX);
+      event.currentTarget.scrollTop = gesture.startTop - (event.clientY - gesture.startY);
+    } else {
+      scrubTo(event.clientX);
+    }
+  };
+
+  const endTimelineGesture = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (timelineGesture.current?.pointerId !== event.pointerId) return;
+    timelineGesture.current = null;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
+  };
+
   const beginDrag = (event: ReactPointerEvent<HTMLDivElement>, clip: Clip) => {
     if (event.button !== 0) return;
     event.preventDefault();
@@ -697,11 +743,11 @@ function Editor() {
         <div className="timeline-toolbar"><div className="timeline-title"><span className="panel-eyebrow">EDIT</span><h2>Timeline</h2><span className="timeline-divider" /><span className="track-count">{project.tracks.length} tracks</span></div><div className="edit-actions"><Button variant="ghost" size="icon" title="Undo" aria-label="Undo" disabled={undoStack.current.length === 0} onClick={undo}><Undo2 /></Button><Button variant="ghost" size="icon" title="Redo" aria-label="Redo" disabled={redoStack.current.length === 0} onClick={redo}><Redo2 /></Button><span className="action-divider" /><Button variant="ghost" size="icon" title="Split at playhead" aria-label="Split at playhead" disabled={!selectedClip || playhead <= selectedClip.start || playhead >= selectedClip.start + selectedClip.duration} onClick={splitSelected}><Scissors /></Button><Button variant="ghost" size="icon" title="Copy clip" aria-label="Copy clip" disabled={!selectedClip} onClick={copySelected}><Copy /></Button><Button variant="ghost" size="icon" title="Paste clip" aria-label="Paste clip" disabled={!copiedClip} onClick={pasteClip}><ClipboardPaste /></Button><Button variant="ghost" size="icon" title="Duplicate clip" aria-label="Duplicate clip" disabled={!selectedClip} onClick={duplicateSelected}><Plus /></Button><Button variant="ghost" size="icon" title="Delete clip" aria-label="Delete clip" disabled={!selectedClip} onClick={deleteSelected}><Trash2 /></Button></div><div className="zoom-actions"><Button variant="ghost" size="icon" title="Zoom out" aria-label="Zoom out" disabled={zoom <= 32} onClick={() => setZoom((value) => Math.max(32, value - 12))}><ZoomOut /></Button><span>{Math.round(zoom / 72 * 100)}%</span><Button variant="ghost" size="icon" title="Zoom in" aria-label="Zoom in" disabled={zoom >= 144} onClick={() => setZoom((value) => Math.min(144, value + 12))}><ZoomIn /></Button></div></div>
 
         <div className="timeline-body">
-          <div ref={timelineRef} className="timeline-scroll" onPointerDown={(event) => { if (event.target === event.currentTarget) { const rect = event.currentTarget.getBoundingClientRect(); setPlayhead(Math.max(0, (event.clientX - rect.left - TRACK_RAIL_WIDTH + event.currentTarget.scrollLeft) / zoom)); setSelectedId(null); } }}>
+          <div ref={timelineRef} className="timeline-scroll" onPointerDown={beginTimelineGesture} onPointerMove={moveTimelineGesture} onPointerUp={endTimelineGesture} onPointerCancel={endTimelineGesture}>
             <div className="timeline-grid">
           <div className="track-rail"><div className="rail-ruler">00:00:00</div><div className="track-rail-list">{visibleTracks.map((track) => <div className={`track-label ${track.kind} ${track.muted ? "muted" : ""} ${track.hidden ? "hidden" : ""}`} key={track.id}><span className="track-type-icon">{track.kind === "visual" ? <Film size={14} /> : track.kind === "voice" ? <Mic size={14} /> : <AudioLines size={14} />}</span><span className="track-name">{track.name}</span><span className="track-kind-label">{track.category.toUpperCase()}</span><DropdownMenu><DropdownMenuTrigger asChild><Button variant="ghost" size="icon" className="track-menu" title={`${track.name} options`} aria-label={`${track.name} options`}><MoreHorizontal /></Button></DropdownMenuTrigger><DropdownMenuContent align="start" className="track-menu-content"><DropdownMenuLabel>{track.name}</DropdownMenuLabel><DropdownMenuItem onSelect={() => addTrack(track.category, track.id)}><Plus size={13} /> Add row</DropdownMenuItem>{!track.default && <DropdownMenuItem disabled={!canRemoveTrack(track.id, project.tracks, project.clips)} title={project.clips.some((clip) => clip.trackId === track.id) ? "Move or delete this track's clips first" : undefined} onSelect={() => removeTrack(track.id)}><Trash2 size={13} /> Remove row{project.clips.some((clip) => clip.trackId === track.id) ? " · clips exist" : ""}</DropdownMenuItem>}<DropdownMenuSeparator /><DropdownMenuItem onSelect={() => toggleTrack(track.id, "muted")}>{track.muted ? <Volume2 size={13} /> : <VolumeX size={13} />}{track.muted ? " Unmute audio" : " Mute audio"}</DropdownMenuItem>{track.kind === "visual" && <DropdownMenuItem onSelect={() => toggleTrack(track.id, "hidden")}>{track.hidden ? <Eye size={13} /> : <EyeOff size={13} />}{track.hidden ? " Show in preview" : " Hide from preview"}</DropdownMenuItem>}</DropdownMenuContent></DropdownMenu></div>)}</div></div>
             <div className="timeline-content" style={{ width: `${contentWidth}px` }}>
-              <div className="timeline-ruler" onClick={(event) => { const rect = event.currentTarget.getBoundingClientRect(); setPlayhead(Math.max(0, (event.clientX - rect.left) / zoom)); }}>
+              <div className="timeline-ruler">
               {Array.from({ length: Math.ceil(contentWidth / (zoom * 5)) + 1 }, (_, index) => <span key={index} className="ruler-tick major" style={{ left: `${index * zoom * 5}px` }}><span>{formatTime(index * 5).slice(0, 5)}</span></span>)}
               </div>
               {visibleTracks.map((track) => {
