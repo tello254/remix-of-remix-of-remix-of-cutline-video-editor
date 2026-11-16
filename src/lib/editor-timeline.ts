@@ -170,5 +170,6 @@ export function nextTrackName<T extends TrackLike & { name: string }>(tracks: T[
  */
 export function canRemoveTrack<T extends { id: string; default?: boolean }>(trackId: string, tracks: T[], clips: { trackId: string }[]) {
   const track = tracks.find((item) => item.id === trackId);
-  return Boolean(track) && !track.default && !clips.some((clip) => clip.trackId === trackId);
+  if (!track || track.default) return false;
+  return !clips.some((clip) => clip.trackId === trackId);
 }
