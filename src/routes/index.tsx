@@ -52,7 +52,6 @@ import {
   trackInsertionIndex,
   transitionFrameStyle,
   transitionLayersAtTime,
-  trimClip,
   trimClipWithin,
   nearestFreeStart,
   type TrimEdge,
