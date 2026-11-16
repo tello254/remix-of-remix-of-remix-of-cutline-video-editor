@@ -72,7 +72,7 @@ export const Route = createFileRoute("/")({
 
 type MediaKind = "visual" | "audio" | "voice";
 type TrackCategory = "video" | "image" | "voice" | "music";
-type Track = { id: string; kind: MediaKind; category: TrackCategory; name: string; muted?: boolean; hidden?: boolean };
+type Track = { id: string; kind: MediaKind; category: TrackCategory; name: string; muted?: boolean; hidden?: boolean; default?: boolean };
 type Clip = {
   id: string;
   trackId: string;
@@ -93,10 +93,10 @@ type TrimDragState = { clipId: string; edge: TrimEdge; startX: number; original:
 type DropTarget = { type: "preview" | "lane"; trackId: string | null };
 
 const STARTER_TRACKS: Track[] = [
-  { id: "video-1", kind: "visual", category: "video", name: "Video 1" },
-  { id: "image-1", kind: "visual", category: "image", name: "Image 1" },
-  { id: "voice-1", kind: "voice", category: "voice", name: "Voice 1" },
-  { id: "audio-1", kind: "audio", category: "music", name: "Music 1" },
+  { id: "video-1", kind: "visual", category: "video", name: "Video 1", default: true },
+  { id: "image-1", kind: "visual", category: "image", name: "Image 1", default: true },
+  { id: "voice-1", kind: "voice", category: "voice", name: "Voice 1", default: true },
+  { id: "audio-1", kind: "audio", category: "music", name: "Music 1", default: true },
 ];
 const TRACK_RAIL_WIDTH = 146;
 
