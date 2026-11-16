@@ -164,6 +164,12 @@ export function nextTrackName<T extends TrackLike & { name: string }>(tracks: T[
   return `${labels[category]} ${number}`;
 }
 
-export function canRemoveTrack<T extends { id: string }>(trackId: string, tracks: T[], clips: { trackId: string }[]) {
-  return tracks.some((track) => track.id === trackId) && !clips.some((clip) => clip.trackId === trackId);
+/**
+ * The starter rows are the precursors every other row is added from, so they always stay.
+ * Any other row can go once its own clips are gone.
+ */
+export function canRemoveTrack<T extends { id: string; default?: boolean }>(trackId: string, tracks: T[], clips: { trackId: string }[]) {
+  const track = tracks.find((item) => item.id === trackId);
+  if (!track || track.default) return false;
+  return !clips.some((clip) => clip.trackId === trackId);
 }

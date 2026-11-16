@@ -72,7 +72,7 @@ export const Route = createFileRoute("/")({
 
 type MediaKind = "visual" | "audio" | "voice";
 type TrackCategory = "video" | "image" | "voice" | "music";
-type Track = { id: string; kind: MediaKind; category: TrackCategory; name: string; muted?: boolean; hidden?: boolean };
+type Track = { id: string; kind: MediaKind; category: TrackCategory; name: string; muted?: boolean; hidden?: boolean; default?: boolean };
 type Clip = {
   id: string;
   trackId: string;
@@ -93,10 +93,10 @@ type TrimDragState = { clipId: string; edge: TrimEdge; startX: number; original:
 type DropTarget = { type: "preview" | "lane"; trackId: string | null };
 
 const STARTER_TRACKS: Track[] = [
-  { id: "video-1", kind: "visual", category: "video", name: "Video 1" },
-  { id: "image-1", kind: "visual", category: "image", name: "Image 1" },
-  { id: "voice-1", kind: "voice", category: "voice", name: "Voice 1" },
-  { id: "audio-1", kind: "audio", category: "music", name: "Music 1" },
+  { id: "video-1", kind: "visual", category: "video", name: "Video 1", default: true },
+  { id: "image-1", kind: "visual", category: "image", name: "Image 1", default: true },
+  { id: "voice-1", kind: "voice", category: "voice", name: "Voice 1", default: true },
+  { id: "audio-1", kind: "audio", category: "music", name: "Music 1", default: true },
 ];
 const TRACK_RAIL_WIDTH = 146;
 
@@ -699,7 +699,7 @@ function Editor() {
         <div className="timeline-body">
           <div ref={timelineRef} className="timeline-scroll" onPointerDown={(event) => { if (event.target === event.currentTarget) { const rect = event.currentTarget.getBoundingClientRect(); setPlayhead(Math.max(0, (event.clientX - rect.left - TRACK_RAIL_WIDTH + event.currentTarget.scrollLeft) / zoom)); setSelectedId(null); } }}>
             <div className="timeline-grid">
-          <div className="track-rail"><div className="rail-ruler">00:00:00</div><div className="track-rail-list">{visibleTracks.map((track) => <div className={`track-label ${track.kind} ${track.muted ? "muted" : ""} ${track.hidden ? "hidden" : ""}`} key={track.id}><span className="track-type-icon">{track.kind === "visual" ? <Film size={14} /> : track.kind === "voice" ? <Mic size={14} /> : <AudioLines size={14} />}</span><span className="track-name">{track.name}</span><span className="track-kind-label">{track.category.toUpperCase()}</span><DropdownMenu><DropdownMenuTrigger asChild><Button variant="ghost" size="icon" className="track-menu" title={`${track.name} options`} aria-label={`${track.name} options`}><MoreHorizontal /></Button></DropdownMenuTrigger><DropdownMenuContent align="start" className="track-menu-content"><DropdownMenuLabel>{track.name}</DropdownMenuLabel><DropdownMenuItem onSelect={() => addTrack(track.category, track.id)}><Plus size={13} /> Add row</DropdownMenuItem><DropdownMenuItem disabled={!canRemoveTrack(track.id, project.tracks, project.clips)} title={project.clips.some((clip) => clip.trackId === track.id) ? "Move or delete this track's clips first" : undefined} onSelect={() => removeTrack(track.id)}><Trash2 size={13} /> Remove row{project.clips.some((clip) => clip.trackId === track.id) ? " · clips exist" : ""}</DropdownMenuItem><DropdownMenuSeparator /><DropdownMenuItem onSelect={() => toggleTrack(track.id, "muted")}>{track.muted ? <Volume2 size={13} /> : <VolumeX size={13} />}{track.muted ? " Unmute audio" : " Mute audio"}</DropdownMenuItem>{track.kind === "visual" && <DropdownMenuItem onSelect={() => toggleTrack(track.id, "hidden")}>{track.hidden ? <Eye size={13} /> : <EyeOff size={13} />}{track.hidden ? " Show in preview" : " Hide from preview"}</DropdownMenuItem>}</DropdownMenuContent></DropdownMenu></div>)}</div></div>
+          <div className="track-rail"><div className="rail-ruler">00:00:00</div><div className="track-rail-list">{visibleTracks.map((track) => <div className={`track-label ${track.kind} ${track.muted ? "muted" : ""} ${track.hidden ? "hidden" : ""}`} key={track.id}><span className="track-type-icon">{track.kind === "visual" ? <Film size={14} /> : track.kind === "voice" ? <Mic size={14} /> : <AudioLines size={14} />}</span><span className="track-name">{track.name}</span><span className="track-kind-label">{track.category.toUpperCase()}</span><DropdownMenu><DropdownMenuTrigger asChild><Button variant="ghost" size="icon" className="track-menu" title={`${track.name} options`} aria-label={`${track.name} options`}><MoreHorizontal /></Button></DropdownMenuTrigger><DropdownMenuContent align="start" className="track-menu-content"><DropdownMenuLabel>{track.name}</DropdownMenuLabel><DropdownMenuItem onSelect={() => addTrack(track.category, track.id)}><Plus size={13} /> Add row</DropdownMenuItem>{!track.default && <DropdownMenuItem disabled={!canRemoveTrack(track.id, project.tracks, project.clips)} title={project.clips.some((clip) => clip.trackId === track.id) ? "Move or delete this track's clips first" : undefined} onSelect={() => removeTrack(track.id)}><Trash2 size={13} /> Remove row{project.clips.some((clip) => clip.trackId === track.id) ? " · clips exist" : ""}</DropdownMenuItem>}<DropdownMenuSeparator /><DropdownMenuItem onSelect={() => toggleTrack(track.id, "muted")}>{track.muted ? <Volume2 size={13} /> : <VolumeX size={13} />}{track.muted ? " Unmute audio" : " Mute audio"}</DropdownMenuItem>{track.kind === "visual" && <DropdownMenuItem onSelect={() => toggleTrack(track.id, "hidden")}>{track.hidden ? <Eye size={13} /> : <EyeOff size={13} />}{track.hidden ? " Show in preview" : " Hide from preview"}</DropdownMenuItem>}</DropdownMenuContent></DropdownMenu></div>)}</div></div>
             <div className="timeline-content" style={{ width: `${contentWidth}px` }}>
               <div className="timeline-ruler" onClick={(event) => { const rect = event.currentTarget.getBoundingClientRect(); setPlayhead(Math.max(0, (event.clientX - rect.left) / zoom)); }}>
               {Array.from({ length: Math.ceil(contentWidth / (zoom * 5)) + 1 }, (_, index) => <span key={index} className="ruler-tick major" style={{ left: `${index * zoom * 5}px` }}><span>{formatTime(index * 5).slice(0, 5)}</span></span>)}
