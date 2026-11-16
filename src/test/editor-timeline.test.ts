@@ -120,4 +120,10 @@ describe("timeline behavior", () => {
     expect(canRemoveTrack("video-1", tracks, [{ trackId: "video-1" }])).toBe(false);
     expect(canRemoveTrack("missing", tracks, [])).toBe(false);
   });
+
+  it("never lets a default row be removed, even with no clips on it", () => {
+    const tracks = [{ id: "video-1", default: true }, { id: "video-2" }];
+    expect(canRemoveTrack("video-1", tracks, [])).toBe(false);
+    expect(canRemoveTrack("video-2", tracks, [])).toBe(true);
+  });
 });
