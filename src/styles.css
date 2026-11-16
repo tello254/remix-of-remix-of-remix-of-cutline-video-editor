@@ -285,8 +285,9 @@
 .track-label.audio .track-type-icon { color: var(--editor-audio); }
 .track-name { overflow: hidden; flex: 1; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
 .track-kind-label { color: var(--muted-foreground); font-size: 7px; letter-spacing: .06em; }
-.timeline-scroll { min-width: 0; flex: 1; overflow: auto; touch-action: none; overscroll-behavior: contain; scrollbar-color: var(--editor-soft) var(--editor-rail); scrollbar-width: thin; }
-.timeline-content { flex: 0 0 auto; min-height: 100%; position: relative; }
+.timeline-scroll { min-width: 0; flex: 1; overflow: auto; overscroll-behavior: contain; scrollbar-color: var(--editor-soft) var(--editor-rail); scrollbar-width: thin; }
+.timeline-content { flex: 0 0 auto; min-height: 100%; position: relative; touch-action: none; }
+.track-rail { touch-action: pan-y; }
 .timeline-ruler { position: sticky; top: 0; z-index: 5; background-color: var(--editor-rail); background-image: linear-gradient(to right, transparent calc(100% - 1px), var(--editor-separator) calc(100% - 1px)); background-size: 360px 100%; cursor: crosshair; }
 .ruler-tick { position: absolute; top: 0; height: 7px; border-left: 1px solid var(--editor-soft); }
 .ruler-tick.major { height: 12px; border-color: var(--muted-foreground); }
