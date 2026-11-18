@@ -3,6 +3,8 @@ import { createPortal } from "react-dom";
 import {
   ChevronDown,
   ChevronUp,
+  ClipboardPaste,
+  Check,
   Expand,
   MousePointer2,
   PenLine,
@@ -11,6 +13,7 @@ import {
   X,
 } from "lucide-react";
 import type { SlicePoint, SliceShape } from "@/whiteboard/types";
+import { serializeSliceMap, type SliceMapReport } from "@/lib/slice-map";
 
 type SliceMode = "select" | "rect" | "pen";
 
@@ -240,6 +243,7 @@ type SliceEditorDialogProps = {
   selectedId: string | null;
   onSelect: (id: string | null) => void;
   onCreate: (points: SlicePoint[]) => void;
+  onImportMap: (text: string) => SliceMapReport;
   onReorder: (id: string, order: number) => void;
   onDelete: (id: string) => void;
   onClear: () => void;
@@ -254,16 +258,43 @@ export function SliceEditorDialog({
   selectedId,
   onSelect,
   onCreate,
+  onImportMap,
   onReorder,
   onDelete,
   onClear,
   onClose,
 }: SliceEditorDialogProps) {
   const [mode, setMode] = useState<SliceMode>("rect");
+  const [mapOpen, setMapOpen] = useState(false);
+  const [mapText, setMapText] = useState("");
+  const [mapReport, setMapReport] = useState<SliceMapReport | null>(null);
+  const [copied, setCopied] = useState(false);
   // Rows stay in permanent number order, so moving a slice never renumbers it
   // or shuffles the list — only its Position changes.
   const total = slices.length;
   const labelled = [...slices].sort((a, b) => a.number - b.number);
+
+  const applyMap = () => {
+    setMapReport(onImportMap(mapText));
+  };
+
+  const copyMap = () => {
+    const text = serializeSliceMap(slices);
+    const done = () => {
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1600);
+    };
+    if (navigator.clipboard?.writeText) {
+      void navigator.clipboard.writeText(text).then(done).catch(() => {
+        // Clipboard denied: leave the map in the box so it can be copied by hand.
+        setMapOpen(true);
+        setMapText(text);
+      });
+      return;
+    }
+    setMapOpen(true);
+    setMapText(text);
+  };
 
   return createPortal(
     <div className="slice-dialog-backdrop" onPointerDown={onClose}>
@@ -398,6 +429,81 @@ export function SliceEditorDialog({
                 ))}
               </ol>
             )}
+            <div className="slice-map-panel">
+              <button
+                type="button"
+                className="slice-map-toggle"
+                aria-expanded={mapOpen}
+                onClick={() => setMapOpen((open) => !open)}
+              >
+                <ClipboardPaste size={12} />
+                <span>Slice map</span>
+                <small>{mapOpen ? "hide JSON" : "paste JSON borders"}</small>
+                {mapOpen ? <ChevronUp size={11} /> : <ChevronDown size={11} />}
+              </button>
+              {mapOpen && (
+                <div className="slice-map-body">
+                  <textarea
+                    className="slice-map-input"
+                    value={mapText}
+                    spellCheck={false}
+                    placeholder={
+                      '{\n  "slices": [\n    { "order": 1, "cue": "most teams start…",\n      "points": [[0.03,0.08],[0.30,0.08],[0.30,0.92],[0.03,0.92]] }\n  ]\n}'
+                    }
+                    onChange={(event) => {
+                      setMapText(event.target.value);
+                      setMapReport(null);
+                    }}
+                  />
+                  <div className="slice-map-actions">
+                    <button
+                      type="button"
+                      className="slice-map-primary"
+                      disabled={!mapText.trim()}
+                      onClick={applyMap}
+                    >
+                      Import map
+                    </button>
+                    <button type="button" disabled={total === 0} onClick={copyMap}>
+                      {copied ? <Check size={11} /> : <ClipboardPaste size={11} />}
+                      {copied ? "Copied" : "Copy current"}
+                    </button>
+                  </div>
+                  {mapReport && (
+                    <div className="slice-map-report">
+                      {mapReport.errors.length > 0 ? (
+                        <ul className="slice-map-errors">
+                          {mapReport.errors.map((problem, index) => (
+                            <li key={`${problem.path}-${index}`}>
+                              <code>{problem.path}</code> {problem.message}
+                            </li>
+                          ))}
+                        </ul>
+                      ) : (
+                        <>
+                          <p className="slice-map-ok">
+                            Imported {mapReport.slices.length} slice
+                            {mapReport.slices.length === 1 ? "" : "s"} · covers{" "}
+                            {Math.round(mapReport.coverage * 100)}% of the image
+                          </p>
+                          {mapReport.warnings.length > 0 && (
+                            <ul className="slice-map-warnings">
+                              {mapReport.warnings.map((warning, index) => (
+                                <li key={`${warning.path}-${index}`}>{warning.message}</li>
+                              ))}
+                            </ul>
+                          )}
+                        </>
+                      )}
+                    </div>
+                  )}
+                  <p className="slice-map-hint">
+                    Coordinates are 0–1 of the image. A map replaces every slice on this image; if
+                    anything is invalid, nothing is imported.
+                  </p>
+                </div>
+              )}
+            </div>
             <div className="slice-side-foot">
               <span>
                 {total} slice{total === 1 ? "" : "s"} · positions set the drawing order; the hand

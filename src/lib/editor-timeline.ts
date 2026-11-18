@@ -157,6 +157,21 @@ export function trackInsertionIndex<T extends TrackLike>(tracks: T[], category: 
   return nextCategory === -1 ? tracks.length : nextCategory;
 }
 
+/**
+ * Shipping audio never lands on a row that already has a cut: an occupied row
+ * keeps its own clips untouched, and the caller adds a fresh row instead.
+ */
+export function emptyTrackId<T extends TrackLike>(
+  tracks: T[],
+  category: T["category"],
+  clips: { trackId: string }[],
+): string | undefined {
+  return tracks.find(
+    (track) =>
+      track.category === category && !clips.some((clip) => clip.trackId === track.id),
+  )?.id;
+}
+
 export function nextTrackName<T extends TrackLike & { name: string }>(tracks: T[], category: T["category"]) {
   const labels: Record<TrackLike["category"], string> = { video: "Video", image: "Image", voice: "Voice", music: "Music" };
   let number = 1;

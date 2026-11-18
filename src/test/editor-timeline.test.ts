@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { canRemoveTrack, compatibleTrackId, fadeToBlackOverlayOpacity, IMAGE_SCENE_SECONDS, isTimelineGap, isTimelineRangeActive, nextTrackName, timelineTimeAtPointer, timelineWidth, trackInsertionIndex, transitionFrameStyle, transitionLayersAtTime, transitionProgress, trimClip } from "@/lib/editor-timeline";
+import { canRemoveTrack, compatibleTrackId, emptyTrackId, fadeToBlackOverlayOpacity, IMAGE_SCENE_SECONDS, isTimelineGap, isTimelineRangeActive, nextTrackName, timelineTimeAtPointer, timelineWidth, trackInsertionIndex, transitionFrameStyle, transitionLayersAtTime, transitionProgress, trimClip } from "@/lib/editor-timeline";
 
 describe("timeline behavior", () => {
   it("uses four seconds for inserted image scenes", () => {
@@ -112,6 +112,21 @@ describe("timeline behavior", () => {
     const next = [...tracks.slice(0, index), added, ...tracks.slice(index)];
     const onScreen = [...next].reverse().map((track) => track.id);
     expect(onScreen).toEqual(["voice-1", "image-2", "image-3", "image-1", "video-1"]);
+  });
+
+  it("ships audio to an empty row and steps around rows that already have a cut", () => {
+    const tracks = [
+      { id: "voice-1", kind: "voice" as const, category: "voice" as const },
+      { id: "voice-2", kind: "voice" as const, category: "voice" as const },
+      { id: "audio-1", kind: "audio" as const, category: "music" as const },
+    ];
+    expect(emptyTrackId(tracks, "voice", [])).toBe("voice-1");
+    expect(emptyTrackId(tracks, "voice", [{ trackId: "video-1" }])).toBe("voice-1");
+    expect(emptyTrackId(tracks, "voice", [{ trackId: "voice-1" }])).toBe("voice-2");
+    expect(
+      emptyTrackId(tracks, "voice", [{ trackId: "voice-1" }, { trackId: "voice-2" }]),
+    ).toBeUndefined();
+    expect(emptyTrackId(tracks, "music", [])).toBe("audio-1");
   });
 
   it("allows removing only existing tracks with no clips", () => {

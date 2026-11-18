@@ -15,9 +15,15 @@ export const WHITEBOARD_TAIL_SECONDS = 0.4;
  */
 export const WHITEBOARD_LEAD_IN_SECONDS = 0.4;
 
-/** Turns scene time into engine time, holding the blank board during the lead-in. */
-export function whiteboardSeekSeconds(localSeconds: number) {
-  return Math.max(0, localSeconds - WHITEBOARD_LEAD_IN_SECONDS);
+/**
+ * Turns scene time into engine time, holding the blank board during the lead-in.
+ *
+ * A scene whose slices carry an explicit schedule has already placed that
+ * lead-in inside its own bands, so it maps frame-for-frame instead: seeking to
+ * 2.0 s must show exactly the frame that the timeline bar calls 2.0 s.
+ */
+export function whiteboardSeekSeconds(localSeconds: number, scheduled = false) {
+  return Math.max(0, localSeconds - (scheduled ? 0 : WHITEBOARD_LEAD_IN_SECONDS));
 }
 
 /**

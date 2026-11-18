@@ -286,6 +286,8 @@
 .field-label { display: flex; justify-content: space-between; margin-top: 5px; color: var(--muted-foreground); font-size: 10px; }
 .field-label span { color: var(--foreground); }
 .editor-select { height: 34px; padding: 0 9px; color: var(--foreground); background: var(--editor-lane); border: 1px solid var(--editor-separator); border-radius: 4px; font: inherit; font-size: 11px; }
+.editor-input { height: 30px; padding: 0 9px; color: var(--foreground); background: var(--editor-lane); border: 1px solid var(--editor-separator); border-radius: 4px; font: inherit; font-size: 10px; }
+.editor-input:focus { outline: none; border-color: color-mix(in oklab, var(--primary) 60%, transparent); }
 .range-input { width: 100%; accent-color: var(--primary); }
 .transition-preview { display: flex; align-items: center; gap: 9px; padding: 10px; color: var(--muted-foreground); background: var(--editor-lane); border-radius: 4px; font-size: 10px; text-transform: capitalize; }
 .transition-swatch { width: 24px; height: 18px; background: linear-gradient(100deg, var(--editor-video), var(--editor-voice)); border-radius: 2px; }
@@ -301,6 +303,26 @@
 .whiteboard-toggle { display: inline-flex; align-items: center; gap: 5px; color: var(--muted-foreground); font-size: 9px; font-weight: 500; cursor: pointer; }
 .whiteboard-toggle input { width: 13px; height: 13px; accent-color: var(--primary); }
 .whiteboard-hint { margin: 0; color: var(--muted-foreground); font-size: 9px; line-height: 1.5; }
+/* Narration transcription and per-slice cues; both live in the right inspector. */
+.narration-count { color: var(--muted-foreground); font-size: 9px; font-weight: 500; }
+.narration-text { max-height: 96px; overflow-y: auto; margin: 0; padding: 6px 7px; color: var(--foreground); background: var(--editor-lane); border: 1px solid var(--editor-separator); border-radius: 4px; font-size: 10px; line-height: 1.55; }
+.narration-status { display: flex; align-items: center; gap: 6px; margin: 0; color: var(--primary); font-size: 9px; }
+.narration-actions { display: flex; align-items: center; gap: 4px; }
+.narration-actions .button { font-size: 10px; }
+.narration-error { margin: 0; color: var(--editor-voice); font-size: 9px; line-height: 1.5; }
+.spin { animation: spin .9s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.cue-panel { display: flex; flex-direction: column; gap: 8px; padding: 10px; background: color-mix(in oklab, var(--editor-voice) 6%, var(--editor-lane)); border: 1px solid var(--editor-separator); border-radius: 5px; }
+.cue-panel-head { display: flex; align-items: center; justify-content: space-between; gap: 6px; color: var(--foreground); font-size: 10px; font-weight: 600; }
+.cue-sync { display: inline-flex; align-items: center; gap: 4px; padding: 3px 7px; color: var(--primary); background: color-mix(in oklab, var(--primary) 12%, transparent); border: 1px solid color-mix(in oklab, var(--primary) 40%, transparent); border-radius: 4px; font: inherit; font-size: 9px; cursor: pointer; }
+.cue-sync:hover { background: color-mix(in oklab, var(--primary) 22%, transparent); }
+.cue-list { display: flex; flex-direction: column; gap: 4px; }
+.cue-row { display: flex; align-items: center; gap: 6px; }
+.cue-number { flex: 0 0 18px; height: 18px; display: grid; place-items: center; color: var(--muted-foreground); background: var(--editor-surface); border: 1px solid var(--editor-separator); border-radius: 50%; font-size: 9px; }
+.cue-input { min-width: 0; flex: 1; height: 26px; padding: 0 7px; color: var(--foreground); background: var(--editor-surface); border: 1px solid var(--editor-separator); border-radius: 4px; font: inherit; font-size: 10px; }
+.cue-input::placeholder { color: var(--muted-foreground); }
+.cue-input:focus { outline: none; border-color: color-mix(in oklab, var(--primary) 60%, transparent); }
+.cue-status { margin: 0; color: var(--muted-foreground); font-size: 9px; line-height: 1.5; }
 .inspector-empty { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 15px; text-align: center; color: var(--muted-foreground); }
 .inspector-empty-symbol { color: var(--editor-soft); font-size: 21px; }
 .inspector-empty p { margin: 10px 0 4px; color: var(--foreground); font-size: 10px; }
@@ -352,10 +374,22 @@
 .clip-filmstrip.video { background-repeat: no-repeat; background-size: 100% 100%; background-color: #0a0e11; }
 .clip-filmstrip.video:not(.ready) { background-image: linear-gradient(100deg, color-mix(in oklab, var(--editor-video) 30%, #0a0e11), color-mix(in oklab, var(--editor-video) 10%, #0a0e11)); }
 .clip-slices { position: absolute; inset: 0; z-index: 1; pointer-events: none; }
-.clip-slice { position: absolute; top: 0; bottom: 0; border-left: 1px dashed rgb(255 255 255 / 68%); box-shadow: inset 1px 0 0 rgb(0 0 0 / 24%); }
-.clip-slice:last-child { border-right: 1px dashed rgb(255 255 255 / 68%); }
-.clip-slice-index { position: absolute; bottom: 2px; left: 3px; padding: 0 3px; color: #f5f9ff; background: rgb(4 8 10 / 62%); border-radius: 2px; font-size: 7px; line-height: 11px; letter-spacing: .04em; }
-.clip-block > .clip-thumb, .clip-block > .clip-label, .clip-block > .clip-duration { position: relative; z-index: 1; text-shadow: 0 1px 2px rgb(0 0 0 / 85%); }
+.slice-region { position: absolute; top: 0; bottom: 0; }
+/* Lag is opaque on purpose: the slice is queued but nothing is being drawn, so
+   the photo underneath must not read as though that slice had arrived. */
+.slice-region.lag { background-color: #47138a; background-image: repeating-linear-gradient(135deg, rgb(167 139 250 / 30%) 0 3px, transparent 3px 7px); box-shadow: inset -2px 0 0 #a78bfa, inset 0 0 0 1px rgb(139 92 246 / 68%); }
+/* reveal and hold keep the photo visible behind them. */
+.slice-region.anim { background-color: rgb(34 197 94 / 40%); box-shadow: inset -2px 0 0 rgb(74 222 128 / 95%), inset 2px 0 0 rgb(74 222 128 / 72%), inset 0 0 0 1px rgb(34 197 94 / 55%); }
+.slice-region.anim.flagged { background-image: repeating-linear-gradient(45deg, rgb(250 204 21 / 34%) 0 4px, transparent 4px 8px); }
+.slice-region.hold { background-color: rgb(249 115 22 / 32%); box-shadow: inset -1px 0 0 rgb(251 146 60 / 78%), inset 0 0 0 1px rgb(234 88 12 / 40%); }
+.clip-slice-index { position: absolute; bottom: 2px; left: 3px; z-index: 2; padding: 0 3px; color: #f5f9ff; background: rgb(4 8 10 / 62%); border-radius: 2px; font-size: 7px; line-height: 11px; letter-spacing: .04em; }
+.slice-handle { position: absolute; top: 0; bottom: 0; z-index: 4; width: 10px; margin-left: -5px; cursor: ew-resize; pointer-events: auto; touch-action: none; }
+.slice-handle::after { position: absolute; top: 7px; bottom: 7px; left: 4px; width: 2px; border-radius: 1px; background: #f8fafc; box-shadow: 0 0 0 1px rgb(4 8 10 / 55%); content: ""; }
+.slice-handle:hover::after, .slice-handle:active::after { background: #fef08a; }
+.slice-flag { position: absolute; top: 1px; z-index: 5; display: grid; place-items: center; width: 12px; height: 12px; margin-left: 2px; padding: 0; color: #1c1917; background: #facc15; border: 0; border-radius: 50%; font-size: 9px; font-weight: 700; line-height: 1; cursor: pointer; pointer-events: auto; }
+.slice-flag:hover { background: #fde047; }
+.slice-flag-menu { min-width: 13rem; font-size: .78rem; }
+.clip-block > .clip-thumb, .clip-block > .clip-label, .clip-block > .clip-duration, .clip-block > .clip-audio-shipped { position: relative; z-index: 1; text-shadow: 0 1px 2px rgb(0 0 0 / 85%); }
 .clip-block.image::after, .clip-block.video::after { position: absolute; inset: 0; z-index: 0; background: linear-gradient(90deg, rgb(4 8 10 / 78%), rgb(4 8 10 / 22%) 58%, rgb(4 8 10 / 45%)); content: ""; pointer-events: none; }
 .clip-block.selected { z-index: 3; outline: 1px solid var(--primary); outline-offset: 1px; }
 .clip-block.dragging { z-index: 6; opacity: .85; cursor: grabbing; pointer-events: none; }
@@ -365,6 +399,7 @@
 .clip-block.image .clip-thumb { color: var(--editor-image); }
 .clip-label { min-width: 0; overflow: hidden; flex: 1; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
 .clip-duration { color: var(--muted-foreground); font-size: 8px; font-variant-numeric: tabular-nums; }
+.clip-audio-shipped { display: grid; place-items: center; color: var(--muted-foreground); }
 .waveform { position: absolute; right: 6px; bottom: 4px; left: 6px; height: 19px; display: flex; align-items: center; justify-content: space-between; gap: 2px; opacity: .55; }
 .waveform i { min-width: 1px; flex: 1; background: var(--editor-audio); border-radius: 2px; }
 .transition-chip { position: absolute; z-index: 4; top: 12px; width: 24px; height: 20px; display: grid; place-items: center; padding: 0; color: var(--primary-foreground); background: var(--primary); border: 2px solid var(--editor-lane); border-radius: 50%; cursor: pointer; }
@@ -401,6 +436,7 @@
 .settings-fields { display: flex; flex-direction: column; gap: 2px; }
 .global-settings-popover { width: 300px; max-height: min(76vh, 620px); overflow-y: auto; }
 .global-settings-fields { gap: 6px; }
+.settings-divider { height: 1px; margin: 8px 0 2px; background: var(--editor-separator); }
 .settings-subhead { margin-top: 8px; color: var(--muted-foreground); font-size: 9px; font-weight: 700; letter-spacing: .11em; text-transform: uppercase; }
 .style-mode-toggle { display: grid; grid-template-columns: 1fr 1fr; gap: 3px; padding: 3px; background: var(--editor-lane); border: 1px solid var(--editor-separator); border-radius: 5px; }
 .style-mode-toggle button { height: 24px; padding: 0; color: var(--muted-foreground); background: none; border: 0; border-radius: 3px; font: inherit; font-size: 10px; cursor: pointer; }
@@ -558,6 +594,27 @@
 .slice-side-foot { display: flex; flex-direction: column; gap: 6px; margin-top: auto; color: var(--editor-soft); font-size: 9px; line-height: 1.45; }
 .slice-clear { align-self: flex-start; padding: 0; color: var(--editor-soft); background: none; border: 0; font: inherit; font-size: 9px; text-decoration: underline; cursor: pointer; }
 .slice-clear:hover { color: var(--foreground); }
+.slice-map-panel { display: flex; flex-direction: column; gap: 6px; padding-top: 8px; border-top: 1px solid var(--editor-separator); }
+.slice-map-toggle { display: flex; align-items: center; gap: 6px; width: 100%; padding: 0; color: var(--muted-foreground); background: none; border: 0; font: inherit; font-size: 10px; text-align: left; cursor: pointer; }
+.slice-map-toggle span { color: var(--foreground); font-weight: 600; }
+.slice-map-toggle small { flex: 1; color: var(--editor-soft); font-size: 9px; }
+.slice-map-toggle:hover { color: var(--foreground); }
+.slice-map-body { display: flex; flex-direction: column; gap: 6px; }
+.slice-map-input { min-height: 92px; resize: vertical; padding: 7px 8px; color: var(--foreground); background: var(--editor-lane); border: 1px solid var(--editor-separator); border-radius: 5px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 9.5px; line-height: 1.5; }
+.slice-map-input:focus { outline: none; border-color: color-mix(in oklab, var(--primary) 55%, transparent); }
+.slice-map-actions { display: flex; gap: 5px; }
+.slice-map-actions button { height: 24px; display: inline-flex; align-items: center; justify-content: center; gap: 4px; flex: 1; padding: 0 8px; color: var(--muted-foreground); background: var(--editor-lane); border: 1px solid var(--editor-separator); border-radius: 4px; font: inherit; font-size: 9.5px; cursor: pointer; }
+.slice-map-actions button:hover:not(:disabled) { color: var(--foreground); border-color: color-mix(in oklab, var(--primary) 50%, transparent); }
+.slice-map-actions button:disabled { opacity: .4; cursor: default; }
+.slice-map-actions .slice-map-primary { color: #08111b; background: var(--primary); border-color: var(--primary); font-weight: 600; }
+.slice-map-actions .slice-map-primary:hover:not(:disabled) { color: #08111b; background: color-mix(in oklab, var(--primary) 88%, white); border-color: color-mix(in oklab, var(--primary) 88%, white); }
+.slice-map-report { display: flex; flex-direction: column; gap: 5px; }
+.slice-map-ok { margin: 0; color: var(--primary); font-size: 9.5px; line-height: 1.4; }
+.slice-map-errors, .slice-map-warnings { display: flex; flex-direction: column; gap: 4px; margin: 0; padding: 0; list-style: none; font-size: 9px; line-height: 1.45; }
+.slice-map-errors li { color: var(--editor-record); }
+.slice-map-warnings li { color: #f0b657; }
+.slice-map-errors code { color: inherit; opacity: .75; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 8.5px; }
+.slice-map-hint { margin: 0; color: var(--editor-soft); font-size: 8.5px; line-height: 1.45; }
 
 @media (max-width: 760px) {
   .slice-dialog { width: 96vw; height: 92vh; }

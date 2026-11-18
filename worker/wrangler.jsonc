@@ -1,0 +1,21 @@
+{
+  // Deploy with:  bunx wrangler deploy
+  // Local dev with real inference:  bunx wrangler dev
+  //
+  // No API token is needed by the running worker: the `ai` binding below
+  // authenticates through the Worker's own identity. The token is only used
+  // by Wrangler to upload the script.
+  "name": "cutline-asr",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-11-01",
+  "observability": {
+    "enabled": true
+  },
+  "ai": {
+    "binding": "AI"
+  },
+  "vars": {
+    "MODEL": "@cf/openai/whisper-large-v3-turbo",
+    "ALLOWED_ORIGINS": "http://localhost:8080,http://localhost:8081,http://localhost:5173"
+  }
+}

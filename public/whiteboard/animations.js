@@ -1482,6 +1482,27 @@ function setupSlicer() {
     });
   });
   state.slicePts = state.slicePolys.map(buildPolygonWaypoints);
+  // Each slice carries the window the editor solved for it, as a fraction of
+  // the scene. Slices without one fall back to the old uniform blocks so older
+  // projects keep their exact timing.
+  var block = SLICE_PAINT_TICKS + 2 * SLICE_TRAVEL_TICKS;
+  var uniformTotal = Math.max(1, ordered.length * block);
+  state.sliceBands = ordered.map(function (slice, index) {
+    var band = slice && slice.band;
+    if (band && typeof band.start === "number" && typeof band.end === "number") {
+      return {
+        start: Math.max(0, Math.min(1, band.start)),
+        end: Math.max(0, Math.min(1, band.end)),
+      };
+    }
+    return {
+      start: (index * block + SLICE_TRAVEL_TICKS) / uniformTotal,
+      end: (index * block + SLICE_TRAVEL_TICKS + SLICE_PAINT_TICKS) / uniformTotal,
+    };
+  });
+  state.sliceTotalFrames = state.timingSeconds > 0
+    ? Math.max(1, Math.round(state.timingSeconds * SLICE_FPS))
+    : slicerTotalTicks(ordered.length);
   state.sliceTick = 0;
   state.slicePainted = new Array(state.slicePolys.length).fill(0);
   state.noFlashFinish = true;
@@ -1524,73 +1545,95 @@ function slicerOffBoard(point) {
   return { x: point.x, y: state.canvasH + vertical };
 }
 
+/** Frame rate mirrored from src/whiteboard/slicer.ts. */
+var SLICE_FPS = 30;
+
+/**
+ * Paints the slice whose band covers the current frame.
+ *
+ * Bands are fractions of the scene, so the engine no longer decides the
+ * schedule: a slice's reveal is confined to its own green region, and the gaps
+ * between bands are lag (nothing drawn) or hold (previous reveals stay up).
+ * Because bands never overlap, two reveals can never run at once.
+ */
 function tickSlicer() {
   const count = state.slicePolys.length;
-  const total = slicerTotalTicks(count);
-  const per = SLICE_PAINT_TICKS + 2 * SLICE_TRAVEL_TICKS;
-
+  const total = state.sliceTotalFrames || slicerTotalTicks(count);
   if (!count || state.sliceTick >= total) { finishAnim(); return; }
 
   const tick = state.sliceTick++;
-  const index = Math.min(count - 1, Math.floor(tick / per));
-  const local = tick - index * per;
-  // Every slice is bookended by a travel: the hand comes into the scene, paints
-  // the slice, then leaves again. The next slice starts with a fresh entry, so
-  // the viewer sees the hand leave and come back between slices.
-  const mode = local < SLICE_TRAVEL_TICKS
-    ? 'enter'
-    : local < SLICE_TRAVEL_TICKS + SLICE_PAINT_TICKS
-      ? 'paint'
-      : 'exit';
-  const travelLocal = mode === 'enter'
-    ? local
-    : mode === 'exit'
-      ? local - SLICE_TRAVEL_TICKS - SLICE_PAINT_TICKS
-      : 0;
+  const fraction = total <= 1 ? 1 : tick / (total - 1);
 
-  const pts = state.slicePts[index] || [];
-  const poly = state.slicePolys[index];
-  const first = pts[0] || { x: state.contentBounds.x + state.contentBounds.w / 2, y: state.contentBounds.y + state.contentBounds.h / 2 };
-  const last = pts[pts.length - 1] || first;
-
-  let handFrom = null;
-  let handTo = null;
   let hand = null;
 
-  if (mode === 'paint') {
-    const paintLocal = local - SLICE_TRAVEL_TICKS;
-    const progress = Math.min(1, Math.max(0, (paintLocal + 1) / SLICE_PAINT_TICKS));
-    const target = Math.ceil(progress * pts.length);
-    let painted = state.slicePainted[index] || 0;
-    while (painted < target && painted < pts.length) {
-      paintSlicePoint(pts[painted], poly);
-      painted += 1;
+  for (let index = 0; index < count; index++) {
+    const pts = state.slicePts[index] || [];
+    if (!pts.length) continue;
+    const band = state.sliceBands[index] || {
+      start: index / count,
+      end: (index + 1) / count,
+    };
+    const span = Math.max(1e-6, band.end - band.start);
+    const local = (fraction - band.start) / span;
+
+    // Before the band the slice waits (purple lag); after it the reveal is
+    // complete and simply stays on screen (orange hold).
+    let phase = "wait";
+    let target = 0;
+    if (local >= 1) {
+      phase = "done";
+      target = pts.length;
+    } else if (local > 0) {
+      if (local < 0.15) phase = "enter";
+      else if (local <= 0.85) {
+        phase = "paint";
+        target = Math.ceil(((local - 0.15) / 0.7) * pts.length);
+      } else {
+        phase = "exit";
+        target = pts.length;
+      }
     }
-    state.slicePainted[index] = painted;
-    const tip = pts[Math.min(Math.max(0, painted - 1), pts.length - 1)] || first;
-    hand = { x: tip.x, y: tip.y, dir: 1 };
-  } else if (mode === 'enter') {
-    handFrom = slicerOffBoard(first);
-    handTo = first;
-  } else {
-    handFrom = last;
-    handTo = slicerOffBoard(last);
+
+    const painted = state.slicePainted[index] || 0;
+    if (target > painted) {
+      for (let k = painted; k < target && k < pts.length; k++) {
+        paintSlicePoint(pts[k], state.slicePolys[index]);
+      }
+      state.slicePainted[index] = Math.min(target, pts.length);
+    }
+
+    if (phase === "paint") {
+      const done = state.slicePainted[index] || 0;
+      const tip = pts[Math.max(0, done - 1)] || pts[0];
+      hand = { x: tip.x, y: tip.y, dir: 1 };
+    } else if (phase === "enter") {
+      const first = pts[0];
+      const from = slicerOffBoard(first);
+      const t = Math.min(1, local / 0.15);
+      hand = {
+        x: from.x + (first.x - from.x) * t,
+        y: from.y + (first.y - from.y) * t,
+        dir: first.x >= from.x ? 1 : -1,
+      };
+    } else if (phase === "exit") {
+      const last = pts[pts.length - 1];
+      const to = slicerOffBoard(last);
+      const t = Math.min(1, (local - 0.85) / 0.15);
+      hand = {
+        x: last.x + (to.x - last.x) * t,
+        y: last.y + (to.y - last.y) * t,
+        dir: to.x >= last.x ? 1 : -1,
+      };
+    }
   }
 
   ctx.save(); fillBg(ctx); ctx.drawImage(state.revealCanvas, 0, 0); ctx.restore();
 
-  if (!hand) {
-    const t = SLICE_TRAVEL_TICKS <= 1 ? 1 : Math.min(1, travelLocal / (SLICE_TRAVEL_TICKS - 1));
-    hand = {
-      x: handFrom.x + (handTo.x - handFrom.x) * t,
-      y: handFrom.y + (handTo.y - handFrom.y) * t,
-      dir: handTo.x >= handFrom.x ? 1 : -1,
-    };
-  }
-
+  // The hand only exists while a reveal is being drawn. During lag and hold it
+  // is genuinely off-screen, which is what makes the pause read as a pause.
   hctx.clearRect(0, 0, state.canvasW, state.canvasH);
-  drawHand(hctx, hand.x, hand.y, hand.dir, state.hand);
-  setProgress(tick / total);
+  if (hand) drawHand(hctx, hand.x, hand.y, hand.dir, state.hand);
+  setProgress(total <= 1 ? 1 : tick / total);
 
   if (tick >= total - 1) finishAnim();
 }

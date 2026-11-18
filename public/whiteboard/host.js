@@ -481,6 +481,10 @@
   function applyConfig(config) {
     var cfg = Object.assign({}, DEFAULT_CONFIG, config || {});
     state.slices = Array.isArray(cfg.slices) ? cfg.slices : [];
+    // Length of the editor's solved slice schedule. When present the scene runs
+    // for exactly this long, so one engine frame equals one timeline frame and
+    // lag/hold gaps survive seeking.
+    state.timingSeconds = Number(cfg.timingSeconds) || 0;
     // Slices take over the scene: they are the user's own cuts, so the base
     // style only matters once the slice list is cleared.
     state.animStyle = state.slices.length ? "slicer" : cfg.style;
@@ -565,6 +569,11 @@
 
   function measureNaturalFrames() {
     prepare();
+    // The editor already solved lag/animation/hold against the clip duration,
+    // so the scene length is known up front — no need to tick to discover it.
+    if (state.timingSeconds > 0 && state.slices.length) {
+      return Math.max(1, Math.min(MAX_FRAMES, Math.round(state.timingSeconds * FPS)));
+    }
     var frames = 0;
     while (!state.done && frames < MAX_FRAMES) {
       tickOnce();

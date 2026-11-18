@@ -1,0 +1,9 @@
+{
+  "name": "cutline-asr",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "bunx vitest run",
+    "typecheck": "bunx tsc -p tsconfig.json --noEmit"
+  }
+}

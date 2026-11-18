@@ -90,7 +90,10 @@ export function WhiteboardStage({
         naturalDuration.current = result.duration ?? 0;
         onNaturalDuration?.(result.duration ?? 0);
         setLoading(false);
-        host.seek(whiteboardSeekSeconds(latestTime.current.time), latestTime.current.duration);
+        host.seek(
+          whiteboardSeekSeconds(latestTime.current.time, Boolean(config.timingSeconds)),
+          latestTime.current.duration,
+        );
       })
       .catch((error) => {
         console.error("Whiteboard engine failed to load", error);
@@ -111,12 +114,15 @@ export function WhiteboardStage({
     const host = hostFrom(iframeRef.current);
     if (!host) return;
     try {
-      host.seek(whiteboardSeekSeconds(Math.max(0, time)), Math.max(0, duration));
+      host.seek(
+        whiteboardSeekSeconds(Math.max(0, time), Boolean(config.timingSeconds)),
+        Math.max(0, duration),
+      );
     } catch (error) {
       console.error("Whiteboard engine seek failed", error);
       setFailed(true);
     }
-  }, [frameReady, loading, failed, time, duration]);
+  }, [frameReady, loading, failed, time, duration, config.timingSeconds]);
 
   useEffect(() => {
     if (!frameReady) return;

@@ -93,6 +93,30 @@ export type SliceShape = {
   /** 1-based position in the animation sequence: 1 plays first. */
   order: number;
   points: SlicePoint[];
+  /**
+   * The narration phrase that should start this slice's reveal. It is only a
+   * lookup key into the transcript; `timing.intendedStart` holds the resolved
+   * time once the cue is synced.
+   */
+  cue?: string | undefined;
+  /**
+   * Resolved timing, as fractions of the scene (0–1). The engine paints this
+   * slice only inside `band`, so a slice can wait its turn while the previous
+   * reveal holds — the lag/animation/hold split from `slice-timing.ts`.
+   */
+  band?: { start: number; end: number };
+  /** Authored timing inputs; lag and hold are derived from them. */
+  timing?: {
+    intendedStart?: number;
+    animation?: number;
+    minHold?: number;
+    startOverride?: number | null;
+    anchor?: { wordIndex: number; text: string; time: number } | null;
+    anchorStart?: number | null;
+    /** Widened cue search, set by the "too tight" fix. */
+    anchorWindow?: number | null;
+    crossClause?: boolean | null;
+  };
 };
 
 export type WhiteboardRevealStyle =
@@ -162,6 +186,12 @@ export type WhiteboardConfig = {
   textDrawStyle: "reveal" | "outline" | "outline-fill";
   /** User-drawn regions; when present the engine animates them in order. */
   slices?: SliceShape[];
+  /**
+   * Length of the slice schedule in seconds. When set, the engine's frame count
+   * follows it instead of the uniform `slices × block` estimate, so seeking
+   * maps one engine frame to one timeline frame.
+   */
+  timingSeconds?: number;
 };
 
 export const DEFAULT_WHITEBOARD_CONFIG: WhiteboardConfig = {

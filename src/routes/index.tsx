@@ -1,6 +1,7 @@
 import { createFileRoute } from "@tanstack/react-router";
 import {
   AudioLines,
+  Captions,
   Check,
   ChevronDown,
   ChevronUp,
@@ -21,6 +22,7 @@ import {
   Play,
   Plus,
   Redo2,
+  RefreshCw,
   Scissors,
   SlidersHorizontal,
   Trash2,
@@ -33,6 +35,7 @@ import {
   ZoomOut,
 } from "lucide-react";
 import {
+  Fragment,
   startTransition,
   useCallback,
   useEffect,
@@ -51,15 +54,30 @@ import {
   DropdownMenuItem,
   DropdownMenuLabel,
   DropdownMenuSeparator,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetTrigger } from "@/components/ui/sheet";
+import { loadAsrConfig, saveAsrConfig, type AsrConfig } from "@/lib/asr-config";
 import { buildFilmstrip, cachedFilmstrip, filmstripKey } from "@/lib/clip-filmstrip";
+import { loadStoredMedia, requestPersistentStorage, storeMediaFile } from "@/lib/media-store";
+import { parseSliceMap, type SliceMapReport } from "@/lib/slice-map";
+import { syncSliceCues } from "@/lib/slice-sync";
+import { transcribeAudio, type TranscriptionResult } from "@/lib/transcribe-audio";
 import { SliceEditorDialog, SliceSurface } from "@/components/slice-editor";
 import { PreviewBoard } from "@/whiteboard/PreviewBoard";
 import { WhiteboardStage } from "@/whiteboard/WhiteboardStage";
-import { slicerBands } from "@/whiteboard/slicer";
+import {
+  ANCHOR_WINDOW_SECONDS,
+  MIN_SLICE_ANIMATION,
+  MIN_SLICE_HOLD,
+  resolveSliceTiming,
+  timingBands,
+  type SliceTimingFlag,
+} from "@/lib/slice-timing";
 import {
   measureWhiteboardDuration,
   warmUpWhiteboardMeasurement,
@@ -87,6 +105,7 @@ import {
 import {
   compatibleTrackId,
   canRemoveTrack,
+  emptyTrackId,
   fadeToBlackOverlayOpacity,
   IMAGE_SCENE_SECONDS,
   isTrackCompatible,
@@ -142,9 +161,15 @@ type Clip = {
   durationLocked?: boolean;
   /** User-drawn regions of an image; when present the scene animates them in order. */
   slices?: SliceShape[] | undefined;
+  /** Timed words for an audio clip, produced by the narration worker. */
+  transcript?: TranscriptionResult | undefined;
   /** When true this scene uses `whiteboard` instead of the project-wide settings. */
   whiteboardOverride?: boolean;
   whiteboard?: WhiteboardConfig | undefined;
+  /** Set once this video's audio has been moved to a voice or music row. */
+  audioShipped?: boolean;
+  /** On a cut created by Audioship: the video clip its audio came from. */
+  audioSourceClipId?: string;
   /** Size of the imported file, used for the library's storage readout. */
   size?: number;
 };
@@ -157,7 +182,7 @@ type Project = {
   transitions: Transition[];
   settings: ProjectSettings;
 };
-type MediaItem = Omit<Clip, "trackId" | "start">;
+type MediaItem = Omit<Clip, "trackId" | "start" | "transcript">;
 /** Library sections; voice lives only on the timeline, so it is not listed here. */
 type LibraryKind = "image" | "video" | "audio";
 const LIBRARY_KINDS: { value: LibraryKind; label: string }[] = [
@@ -307,30 +332,255 @@ function ClipFilmstrip({ clip }: { clip: Clip }) {
   return null;
 }
 
+/** Which end of a slice's reveal a drag is moving. */
+type SliceBoundary = "start" | "end";
+/** The three fixes offered when a reveal cannot fit where it was asked to. */
+type SliceFlagAction = "speed-up" | "widen-cue" | "drop";
+type SliceDragPreview = { sliceId: string; edge: SliceBoundary; delta: number };
+type SliceDragState = {
+  clipId: string;
+  sliceId: string;
+  edge: SliceBoundary;
+  startX: number;
+  startLeft: number;
+  delta: number;
+  /** The clip as it was when the drag began, so the maths never compounds. */
+  original: Clip;
+};
+
+const clampTo = (value: number, min: number, max: number) =>
+  Math.min(Math.max(value, min), Math.max(min, max));
+
+const SLICE_FLAG_TEXT: Record<SliceTimingFlag, string> = {
+  clamped: "pushed past the previous reveal",
+  tight: "reveal does not fit before the next slice",
+  override: "start moved by hand",
+  early: "starts before the narration describes it",
+};
+
 /**
- * Marks where each user slice is painted inside an image cut. The segments
- * follow the engine's travel-then-paint timing, so reading left to right gives
- * the animation sequence and the labels are the permanent slice numbers.
+ * Turns the clip's authored timing into the fractions the engine paints in.
+ * Slices without authored timing fall back to the uniform schedule, so older
+ * projects keep exactly the reveal they had before.
  */
-function ClipSlices({ clip }: { clip: Clip }) {
+function bandedSlices(clip: Clip): SliceShape[] {
+  const ordered = [...(clip.slices ?? [])].sort((a, b) => a.order - b.order);
+  const { slices: timings, sceneSeconds } = resolveSliceTiming(ordered, clip.duration);
+  const bands = timingBands(timings, sceneSeconds);
+  return ordered.map((slice, index) => ({
+    ...slice,
+    band: bands[index] ?? { start: 0, end: 0 },
+  }));
+}
+
+/**
+ * Finds the narration covering an image clip, plus the offset that maps
+ * transcript time onto the clip's own timeline. Words before the image or after
+ * it stay in the list — the cue resolver is the one that decides they are out
+ * of range.
+ */
+function narrationForClip(clip: Clip, clips: Clip[]) {
+  const best = clips
+    .filter((candidate) => candidate.mediaType === "audio" && candidate.transcript)
+    .map((candidate) => ({
+      candidate,
+      overlap:
+        Math.min(clip.start + clip.duration, candidate.start + candidate.duration) -
+        Math.max(clip.start, candidate.start),
+    }))
+    .filter((entry) => entry.overlap > 0)
+    .sort((a, b) => b.overlap - a.overlap)[0];
+
+  const audio = best?.candidate;
+  const transcript = audio?.transcript;
+  if (!audio || !transcript) return null;
+  return {
+    transcript,
+    offsetSeconds: clip.start - audio.start + audio.sourceOffset,
+  };
+}
+
+/**
+ * Shows the schedule of one image cut as the three regions the audio implies:
+ *
+ *   purple  lag  — the slice is queued but nothing is drawn yet. Opaque, so
+ *                  the photo behind it reads as "not this slice yet".
+ *   green   animation — the reveal itself; the photo shows through.
+ *   orange  hold — the finished reveal, also showing the photo behind it.
+ *
+ * A lag is allowed to sit on top of the previous slice's hold (it is drawn
+ * last, so purple wins where they overlap), but reveals never overlap: the
+ * drag bounds are the previous reveal's end and the next reveal's start.
+ */
+function ClipSlices({
+  clip,
+  selected,
+  drag,
+  onBoundaryDrag,
+  onFlagAction,
+}: {
+  clip: Clip;
+  selected: boolean;
+  drag: SliceDragPreview | null;
+  onBoundaryDrag: (
+    event: ReactPointerEvent<HTMLSpanElement>,
+    clip: Clip,
+    slice: SliceShape,
+    edge: SliceBoundary,
+  ) => void;
+  onFlagAction: (clip: Clip, slice: SliceShape, action: SliceFlagAction, value?: number) => void;
+}) {
   const slices = clip.slices ?? [];
   if (clip.mediaType !== "image" || slices.length < 2) return null;
-  const sequence = [...slices].sort((a, b) => a.order - b.order);
-  const bands = slicerBands(sequence.length, clip.duration);
+  const ordered = [...slices].sort((a, b) => a.order - b.order);
+  const { slices: timings } = resolveSliceTiming(ordered, clip.duration);
+  const total = Math.max(0.01, clip.duration);
+  const percent = (value: number) => `${clampTo(value / total, 0, 1) * 100}%`;
+
+  // Solve the previewed boundary once, so the previous hold and the next lag
+  // follow the handle while it is being dragged.
+  const starts = timings.map((timing) => timing.start);
+  const ends = timings.map((timing) => timing.animEnd);
+  if (drag) {
+    const index = ordered.findIndex((slice) => slice.id === drag.sliceId);
+    if (index >= 0) {
+      const timing = timings[index];
+      const previousEnd = timings[index - 1]?.animEnd ?? 0;
+      const nextStart = timings[index + 1]?.start ?? total;
+      if (timing && drag.edge === "start") {
+        starts[index] = clampTo(
+          timing.start + drag.delta,
+          previousEnd,
+          Math.max(previousEnd, (ends[index] ?? 0) - MIN_SLICE_ANIMATION),
+        );
+      } else if (timing) {
+        ends[index] = clampTo(
+          timing.animEnd + drag.delta,
+          (starts[index] ?? 0) + MIN_SLICE_ANIMATION,
+          Math.max((starts[index] ?? 0) + MIN_SLICE_ANIMATION, nextStart),
+        );
+      }
+    }
+  }
+
   return (
-    <span className="clip-slices" aria-hidden="true">
-      {bands.map((band, index) => (
-        <span
-          key={sequence[index]?.id ?? index}
-          className="clip-slice"
-          style={{
-            left: `${band.start * 100}%`,
-            width: `${Math.max(0, band.end - band.start) * 100}%`,
-          }}
-        >
-          <span className="clip-slice-index">{sequence[index]?.number ?? band.order}</span>
-        </span>
-      ))}
+    <span
+      className={`clip-slices ${selected ? "is-editable" : ""}`}
+      role="group"
+      aria-label="Slice timing"
+    >
+      {ordered.map((slice, index) => {
+        const timing = timings[index];
+        if (!timing) return null;
+        const start = starts[index] ?? 0;
+        const animEnd = ends[index] ?? 0;
+        const previousEnd = timings[index - 1]?.animEnd ?? 0;
+        const nextStart = starts[index + 1] ?? total;
+        const intended = timing.start - timing.lag;
+        const holdEnd = Math.max(animEnd, nextStart);
+        // The lag starts where the words said it should, but never inside the
+        // previous reveal — only a hold may be overlapped.
+        const lagFrom = clampTo(Math.min(intended, start), previousEnd, start);
+        const lagWidth = Math.max(0, start - lagFrom);
+        const holdWidth = Math.max(0, holdEnd - animEnd);
+        const flags = timing.flags;
+        // A hand-moved start is already visible as the purple lag, so the
+        // warning badge is reserved for problems the user cannot see: a
+        // collision, a missing hold, or a reveal running ahead of the words.
+        const problems = flags.filter((flag) => flag !== "override");
+        // A reveal may be shortened until it only just fits, but it must still
+        // leave the minimum hold — below that, speeding up cannot fix it.
+        const speedTarget = Math.max(MIN_SLICE_ANIMATION, nextStart - start - MIN_SLICE_HOLD);
+        const canSpeedUp = speedTarget < timing.animation - 0.01;
+        const label = [
+          `Slice ${slice.number}`,
+          `lag ${(start - intended).toFixed(2)}s`,
+          `draw ${(animEnd - start).toFixed(2)}s`,
+          `hold ${holdWidth.toFixed(2)}s`,
+          ...flags.map((flag) => SLICE_FLAG_TEXT[flag]),
+        ].join(" · ");
+
+        return (
+          <Fragment key={slice.id}>
+            {lagWidth > 0.001 && (
+              <span
+                className="slice-region lag"
+                style={{ left: percent(lagFrom), width: percent(lagWidth) }}
+                title={`Slice ${slice.number} waits ${(start - intended).toFixed(2)}s for its cue`}
+              />
+            )}
+            <span
+              className={`slice-region anim ${problems.length ? "flagged" : ""}`}
+              style={{ left: percent(start), width: percent(animEnd - start) }}
+              title={label}
+            >
+              <span className="clip-slice-index">{slice.number}</span>
+            </span>
+            {holdWidth > 0.001 && (
+              <span
+                className="slice-region hold"
+                style={{ left: percent(animEnd), width: percent(holdWidth) }}
+                title={`Slice ${slice.number} holds for ${holdWidth.toFixed(2)}s`}
+              />
+            )}
+            {selected && (
+              <>
+                <span
+                  className="slice-handle start"
+                  style={{ left: percent(start) }}
+                  title="Drag to change how long this slice waits for its cue"
+                  onPointerDown={(event) => onBoundaryDrag(event, clip, slice, "start")}
+                />
+                <span
+                  className="slice-handle end"
+                  style={{ left: percent(animEnd) }}
+                  title="Drag to give the reveal more time and shorten the hold"
+                  onPointerDown={(event) => onBoundaryDrag(event, clip, slice, "end")}
+                />
+              </>
+            )}
+            {problems.length > 0 && (
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <button
+                    type="button"
+                    className="slice-flag"
+                    style={{ left: percent(start) }}
+                    title={`Slice ${slice.number}: ${problems
+                      .map((flag) => SLICE_FLAG_TEXT[flag])
+                      .join("; ")}`}
+                    aria-label={`Slice ${slice.number} timing needs attention`}
+                    onPointerDown={(event) => event.stopPropagation()}
+                    onClick={(event) => event.stopPropagation()}
+                  >
+                    !
+                  </button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="start" side="top" className="slice-flag-menu">
+                  <DropdownMenuLabel>Reveal timing</DropdownMenuLabel>
+                  <DropdownMenuItem
+                    disabled={!canSpeedUp}
+                    title={
+                      canSpeedUp
+                        ? "Draw this reveal faster so it fits before the next slice"
+                        : "This reveal is already as short as the speed limit allows"
+                    }
+                    onSelect={() => onFlagAction(clip, slice, "speed-up", speedTarget)}
+                  >
+                    Speed the reveal up to {speedTarget.toFixed(2)}s
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onSelect={() => onFlagAction(clip, slice, "widen-cue")}>
+                    Widen the cue search
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onSelect={() => onFlagAction(clip, slice, "drop")}>
+                    Drop this slice
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
+            )}
+          </Fragment>
+        );
+      })}
     </span>
   );
 }
@@ -358,6 +608,7 @@ function Editor() {
   const [selectedTransition, setSelectedTransition] = useState<string | null>(null);
   const [drag, setDrag] = useState<DragState | null>(null);
   const [trimDrag, setTrimDrag] = useState<TrimDragState | null>(null);
+  const [sliceDrag, setSliceDrag] = useState<SliceDragState | null>(null);
   const [dropTarget, setDropTarget] = useState<DropTarget | null>(null);
   const [libraryOpen, setLibraryOpen] = useState(false);
   const [libraryKind, setLibraryKind] = useState<LibraryKind>("image");
@@ -456,10 +707,25 @@ function Editor() {
     ? resolveWhiteboard(selectedClip, project.settings)
     : project.settings.whiteboard;
   const selectedFollowsGlobal = selectedClip ? !selectedClip.whiteboardOverride : true;
+  const selectedSlices = selectedClip
+    ? [...(selectedClip.slices ?? [])].sort((a, b) => a.order - b.order)
+    : [];
   const cutsSlices = cutsClip?.slices ?? [];
   const [sliceEditorOpen, setSliceEditorOpen] = useState(false);
   const [sliceSettingsOpen, setSliceSettingsOpen] = useState(false);
   const [selectedSliceId, setSelectedSliceId] = useState<string | null>(null);
+  const [asr, setAsr] = useState<AsrConfig>(() => loadAsrConfig());
+  const [asrJob, setAsrJob] = useState<{ clipId: string; done: number; total: number } | null>(
+    null,
+  );
+  const [asrError, setAsrError] = useState<string | null>(null);
+  const [cueDrafts, setCueDrafts] = useState<Record<string, string>>({});
+  const [cueStatus, setCueStatus] = useState<string | null>(null);
+
+  // A sync report belongs to the clip it was run on, not the next one selected.
+  useEffect(() => {
+    setCueStatus(null);
+  }, [selectedId]);
 
   const commitProject = useCallback(
     (next: Project | ((current: Project) => Project), options?: { silent?: boolean }) => {
@@ -507,7 +773,10 @@ function Editor() {
             !clip ||
             clip.mediaType !== "image" ||
             !resolveWhiteboard(clip, current.settings).enabled ||
-            clip.durationLocked
+            clip.durationLocked ||
+            // A sliced cut is timed against its audio, so its length is the
+            // authority — growing it here would drag every cue out of place.
+            (clip.slices?.length ?? 0) > 0
           )
             return current;
           if (Math.abs(clip.duration - seconds) < 0.05) return current;
@@ -640,6 +909,17 @@ function Editor() {
   const selectedMediaActive = project.clips.some(
     (clip) => clip.kind === "visual" && isTimelineRangeActive(clip, playhead),
   );
+  // Video rows that still have audio to hand over; the row menu uses this to
+  // avoid offering Audioship when there is nothing left to ship.
+  const rowsWithUnshippedAudio = useMemo(
+    () =>
+      new Set(
+        project.clips
+          .filter((clip) => clip.mediaType === "video" && !clip.audioShipped)
+          .map((clip) => clip.trackId),
+      ),
+    [project.clips],
+  );
   // How many image scenes use the global animation settings and how many carry
   // their own — shown in the global settings panel.
   const sceneCounts = useMemo(() => {
@@ -767,6 +1047,18 @@ function Editor() {
         };
         mediaUrls.current.push(item.src);
         setMedia((current) => [...current, item]);
+        // Keep a copy in the browser so the library survives a reload.
+        requestPersistentStorage();
+        void storeMediaFile({
+          id: item.id,
+          name: item.name,
+          kind: item.kind,
+          mediaType: item.mediaType,
+          duration: item.duration,
+          size: item.size ?? file.size,
+          createdAt: Date.now(),
+          blob: file,
+        }).catch((error) => console.error("Media could not be stored", error));
         // Imported files land in the library first. Only an explicit drop onto a
         // track or the canvas places a clip straight away.
         if (destination) placeMedia(item, destination.trackId, destination.at);
@@ -786,6 +1078,42 @@ function Editor() {
     );
     if (fallback) setLibraryKind(fallback.value);
   }, [media, libraryKind]);
+
+  // Imported files live in IndexedDB; rebuild their object URLs on startup so
+  // the library is still there after a reload.
+  const storedMediaLoaded = useRef(false);
+  useEffect(() => {
+    if (storedMediaLoaded.current) return;
+    storedMediaLoaded.current = true;
+    let disposed = false;
+    void loadStoredMedia()
+      .then((records) => {
+        if (disposed || !records.length) return;
+        const restored: MediaItem[] = records.map((record) => {
+          const src = URL.createObjectURL(record.blob);
+          mediaUrls.current.push(src);
+          return {
+            id: record.id,
+            kind: record.kind,
+            mediaType: record.mediaType,
+            name: record.name,
+            src,
+            duration: record.duration,
+            sourceDuration: record.duration,
+            sourceOffset: 0,
+            size: record.size,
+          };
+        });
+        setMedia((current) => {
+          const existing = new Set(current.map((item) => item.id));
+          return [...restored.filter((item) => !existing.has(item.id)), ...current];
+        });
+      })
+      .catch((error) => console.error("Stored media could not be restored", error));
+    return () => {
+      disposed = true;
+    };
+  }, []);
 
   const placeLibraryItem = useCallback(
     (item: MediaItem) => {
@@ -885,6 +1213,70 @@ function Editor() {
     [commitProject],
   );
 
+  /**
+   * Moves a video row's audio onto its own voice or music row, leaving the
+   * picture behind. The extracted cut keeps the source clip's start, length and
+   * in-point so playback stays in sync, and the source video is silenced so the
+   * same voice cannot play twice. An occupied row is never displaced: the audio
+   * gets a new row of its category instead.
+   */
+  const shipAudioToRow = useCallback(
+    (sourceTrackId: string, target: "voice" | "music") => {
+      const state = projectRef.current;
+      const videos = state.clips
+        .filter(
+          (clip) =>
+            clip.trackId === sourceTrackId &&
+            clip.mediaType === "video" &&
+            !clip.audioShipped,
+        )
+        .sort((a, b) => a.start - b.start);
+      if (!videos.length) return;
+
+      const category: TrackCategory = target === "voice" ? "voice" : "music";
+      const tracks = [...state.tracks];
+      let targetTrackId = emptyTrackId(tracks, category, state.clips);
+      if (!targetTrackId) {
+        const track: Track = {
+          id: makeId(),
+          kind: target === "voice" ? "voice" : "audio",
+          category,
+          name: nextTrackName(tracks, category),
+        };
+        tracks.splice(trackInsertionIndex(tracks, category), 0, track);
+        targetTrackId = track.id;
+      }
+
+      const copies: Clip[] = videos.map((clip) => {
+        // Scene-only fields would make the audio cut look like an image scene.
+        const { slices, whiteboard, whiteboardOverride, ...audioSource } = clip;
+        return {
+          ...audioSource,
+          id: makeId(),
+          trackId: targetTrackId,
+          kind: target === "voice" ? "voice" : "audio",
+          mediaType: "audio",
+          name: `${clip.name} · audio`,
+          audioSourceClipId: clip.id,
+        };
+      });
+      const shippedIds = new Set(videos.map((clip) => clip.id));
+
+      commitProject((current) => ({
+        ...current,
+        tracks,
+        clips: [
+          ...current.clips.map((clip) =>
+            shippedIds.has(clip.id) ? { ...clip, audioShipped: true } : clip,
+          ),
+          ...copies,
+        ],
+      }));
+      setSelectedId(copies[0]?.id ?? null);
+    },
+    [commitProject],
+  );
+
   const removeTrack = useCallback(
     (trackId: string) => {
       if (!canRemoveTrack(trackId, projectRef.current.tracks, projectRef.current.clips)) return;
@@ -910,13 +1302,30 @@ function Editor() {
 
   const deleteSelected = useCallback(() => {
     if (!selectedId) return;
-    commitProject((current) => ({
-      ...current,
-      clips: current.clips.filter((clip) => clip.id !== selectedId),
-      transitions: current.transitions.filter(
-        (item) => item.leftId !== selectedId && item.rightId !== selectedId,
-      ),
-    }));
+    commitProject((current) => {
+      const removed = current.clips.find((clip) => clip.id === selectedId);
+      const remaining = current.clips.filter((clip) => clip.id !== selectedId);
+      // Deleting a shipped copy gives the sound back to its video, unless
+      // another copy still plays it (a split half or a duplicate).
+      const stillReferenced = new Set(
+        remaining
+          .map((clip) => clip.audioSourceClipId)
+          .filter((id): id is string => Boolean(id)),
+      );
+      const restoredSourceId =
+        removed?.audioSourceClipId && !stillReferenced.has(removed.audioSourceClipId)
+          ? removed.audioSourceClipId
+          : null;
+      return {
+        ...current,
+        clips: remaining.map((clip) =>
+          clip.id === restoredSourceId ? { ...clip, audioShipped: false } : clip,
+        ),
+        transitions: current.transitions.filter(
+          (item) => item.leftId !== selectedId && item.rightId !== selectedId,
+        ),
+      };
+    });
     setSelectedId(null);
   }, [commitProject, selectedId]);
 
@@ -1131,7 +1540,15 @@ function Editor() {
             )?.InkplainerHost;
             if (!host?.ready || !host.seek) return;
             try {
-              host.seek(whiteboardSeekSeconds(Math.max(0, time - clip.start)), clip.duration);
+              // A sliced cut maps frame-for-frame; an unscheduled one still
+              // holds the blank lead-in before the drawing starts.
+              host.seek(
+                whiteboardSeekSeconds(
+                  Math.max(0, time - clip.start),
+                  (clip.slices?.length ?? 0) > 0,
+                ),
+                clip.duration,
+              );
             } catch {
               // A stage that is still booting simply stays where it is.
             }
@@ -1265,7 +1682,7 @@ function Editor() {
         const localTime =
           clip.sourceOffset + Math.min(clip.duration, Math.max(0, playhead - clip.start));
         if (Math.abs(element.currentTime - localTime) > 0.35) element.currentTime = localTime;
-        element.muted = !active || mutedTracks.has(clip.trackId);
+        element.muted = !active || mutedTracks.has(clip.trackId) || Boolean(clip.audioShipped);
         if (active && element.paused) void element.play().catch(() => undefined);
         if (!active && !element.paused) element.pause();
       });
@@ -1436,7 +1853,7 @@ function Editor() {
   // scrolls the strip and re-applies the gesture against the new scroll
   // position, so a clip can be trimmed or thrown from one end to the other.
   useEffect(() => {
-    if (!drag && !trimDrag && !scrubHeld) return;
+    if (!drag && !trimDrag && !sliceDrag && !scrubHeld) return;
     const viewport = timelineRef.current;
     if (!viewport) return;
     const EDGE_ZONE = 64;
@@ -1499,7 +1916,7 @@ function Editor() {
     };
     frame = requestAnimationFrame(step);
     return () => cancelAnimationFrame(frame);
-  }, [drag, trimDrag, scrubHeld]);
+  }, [drag, trimDrag, sliceDrag, scrubHeld]);
 
   useEffect(
     () => () => {
@@ -1602,6 +2019,310 @@ function Editor() {
     if (!cutsClip) return;
     applyClipSlices(cutsClip, []);
     setSelectedSliceId(null);
+  };
+
+  /**
+   * Imports borders authored outside the editor. Geometry and order come from
+   * the map; nothing about time does. An invalid map changes nothing at all, so
+   * a bad paste can never leave the image half-sliced.
+   */
+  const importSliceMap = (text: string): SliceMapReport => {
+    const report = parseSliceMap(text);
+    if (report.errors.length > 0 || !cutsClip) return report;
+
+    const shapes: SliceShape[] = report.slices.map((slice, index) => ({
+      id: makeId(),
+      number: index + 1,
+      order: slice.order,
+      points: slice.points.map((point) => ({ x: point.x, y: point.y })),
+      ...(slice.cue ? { cue: slice.cue } : {}),
+    }));
+    applyClipSlices(cutsClip, shapes);
+    setSelectedSliceId(shapes[0]?.id ?? null);
+    return report;
+  };
+
+  /**
+   * Writes one slice's authored timing. Only the inputs live on the clip; the
+   * start, lag and hold they produce are always re-derived, so moving a
+   * neighbour is enough to reschedule the rest of the cut.
+   */
+  const patchSliceTiming = useCallback(
+    (
+      clipId: string,
+      sliceId: string,
+      patch: Partial<NonNullable<SliceShape["timing"]>>,
+    ) => {
+      commitProject((current) => ({
+        ...current,
+        clips: current.clips.map((clip) =>
+          clip.id === clipId
+            ? {
+                ...clip,
+                slices: (clip.slices ?? []).map((slice) =>
+                  slice.id === sliceId ? { ...slice, timing: { ...slice.timing, ...patch } } : slice,
+                ),
+              }
+            : clip,
+        ),
+      }));
+    },
+    [commitProject],
+  );
+
+  /** Remembers where the narration worker lives; never written into the project. */
+  const updateAsr = useCallback((patch: Partial<AsrConfig>) => {
+    setAsr((current) => {
+      const next = { ...current, ...patch };
+      saveAsrConfig(next);
+      return next;
+    });
+  }, []);
+
+  /**
+   * Transcribes one narration clip and hangs the words on that clip.
+   *
+   * The transcript is derived data, not an edit: it is written silently so undo
+   * never throws away a transcription the user waited minutes for. Re-running it
+   * overwrites the words in place.
+   */
+  const transcribeNarration = useCallback(
+    async (clip: Clip) => {
+      setAsrError(null);
+      setAsrJob({ clipId: clip.id, done: 0, total: 0 });
+      try {
+        const response = await fetch(clip.src);
+        if (!response.ok) throw new Error(`Could not read "${clip.name}".`);
+        const blob = await response.blob();
+        const transcript = await transcribeAudio(blob, {
+          endpoint: asr.endpoint,
+          token: asr.token || undefined,
+          language: asr.language || undefined,
+          onProgress: (done, total) => setAsrJob({ clipId: clip.id, done, total }),
+        });
+        commitProject(
+          (current) => ({
+            ...current,
+            clips: current.clips.map((item) =>
+              item.id === clip.id ? { ...item, transcript } : item,
+            ),
+          }),
+          { silent: true },
+        );
+        if (!transcript.words.length) {
+          setAsrError("No speech was found in this clip.");
+        }
+      } catch (error) {
+        setAsrError(error instanceof Error ? error.message : "Transcription failed.");
+      } finally {
+        setAsrJob(null);
+      }
+    },
+    [asr, commitProject],
+  );
+
+  /**
+   * Saves one slice's cue phrase. Drafts live in component state so typing does
+   * not push a history entry per keystroke; this runs on blur or Enter and only
+   * records a commit when the phrase actually changed.
+   */
+  const commitSliceCue = useCallback(
+    (clipId: string, sliceId: string, cue: string) => {
+      const trimmed = cue.replace(/\s+/g, " ").trim();
+      setCueDrafts((current) => {
+        if (!(sliceId in current)) return current;
+        const next = { ...current };
+        delete next[sliceId];
+        return next;
+      });
+      commitProject((current) => {
+        const clip = current.clips.find((item) => item.id === clipId);
+        const slice = clip?.slices?.find((item) => item.id === sliceId);
+        if (!clip || !slice || (slice.cue ?? "") === trimmed) return current;
+        return {
+          ...current,
+          clips: current.clips.map((item) =>
+            item.id === clipId
+              ? {
+                  ...item,
+                  slices: (item.slices ?? []).map((entry) =>
+                    entry.id === sliceId ? { ...entry, cue: trimmed || undefined } : entry,
+                  ),
+                }
+              : item,
+          ),
+        };
+      });
+    },
+    [commitProject],
+  );
+
+  /**
+   * Resolves every cue on this image against the narration underneath it and
+   * writes the resulting reveals in one history entry. Cues that are not spoken,
+   * or that belong to another scene, are reported instead of approximated.
+   */
+  const syncCuesToNarration = useCallback(
+    (clip: Clip) => {
+      const narration = narrationForClip(clip, projectRef.current.clips);
+      if (!narration) {
+        setCueStatus("Add narration audio under this image, then transcribe it.");
+        return;
+      }
+
+      const ordered = [...(clip.slices ?? [])].sort((a, b) => a.order - b.order);
+      const result = syncSliceCues(ordered, narration.transcript.words, {
+        offsetSeconds: narration.offsetSeconds,
+        clipDuration: clip.duration,
+      });
+
+      if (result.patches.length) {
+        const patches = new Map(result.patches.map((entry) => [entry.id, entry.timing]));
+        commitProject((current) => ({
+          ...current,
+          clips: current.clips.map((item) =>
+            item.id === clip.id
+              ? {
+                  ...item,
+                  slices: (item.slices ?? []).map((slice) => {
+                    const timing = patches.get(slice.id);
+                    return timing ? { ...slice, timing: { ...slice.timing, ...timing } } : slice;
+                  }),
+                }
+              : item,
+          ),
+        }));
+      }
+
+      const parts: string[] = [];
+      if (result.patches.length) parts.push(`${result.patches.length} timed`);
+      if (result.missing.length) parts.push(`${result.missing.length} not in the narration`);
+      if (result.noCue.length) parts.push(`${result.noCue.length} without a cue`);
+      if (result.clamped.length) parts.push(`${result.clamped.length} pushed later`);
+      setCueStatus(parts.length ? parts.join(" · ") : "This image has no slices yet.");
+    },
+    [commitProject],
+  );
+
+  /** Turns a finished boundary drag into authored timing on the clip. */
+  const applySliceDrag = useCallback(
+    (gesture: SliceDragState, delta: number) => {
+      const clip = gesture.original;
+      const ordered = [...(clip.slices ?? [])].sort((a, b) => a.order - b.order);
+      const { slices: timings } = resolveSliceTiming(ordered, clip.duration);
+      const index = ordered.findIndex((slice) => slice.id === gesture.sliceId);
+      const timing = timings[index];
+      if (!timing) return;
+      const round = (value: number) => Math.round(value * 100) / 100;
+
+      if (gesture.edge === "start") {
+        const previousEnd = timings[index - 1]?.animEnd ?? 0;
+        const start = clampTo(
+          timing.start + delta,
+          previousEnd,
+          Math.max(previousEnd, timing.animEnd - MIN_SLICE_ANIMATION),
+        );
+        if (Math.abs(start - timing.start) < 0.005) return;
+        // Taking the boundary off its cue is exactly what `startOverride`
+        // records, so the resolver stops re-anchoring this slice.
+        patchSliceTiming(clip.id, gesture.sliceId, { startOverride: round(start) });
+        return;
+      }
+
+      const nextStart = timings[index + 1]?.start ?? clip.duration;
+      const animation = clampTo(
+        timing.animation + delta,
+        MIN_SLICE_ANIMATION,
+        Math.max(MIN_SLICE_ANIMATION, nextStart - timing.start),
+      );
+      if (Math.abs(animation - timing.animation) < 0.005) return;
+      patchSliceTiming(clip.id, gesture.sliceId, { animation: round(animation) });
+    },
+    [patchSliceTiming],
+  );
+
+  // A boundary drag previews directly from its pointer delta (see ClipSlices)
+  // and only writes timing on release, so a slow drag never floods the project
+  // history with intermediate states.
+  useEffect(() => {
+    if (!sliceDrag) return;
+    const onMove = (event: PointerEvent) => {
+      heldPointer.current = { id: event.pointerId, x: event.clientX, y: event.clientY };
+      const scrolled = (timelineRef.current?.scrollLeft ?? 0) - sliceDrag.startLeft;
+      setSliceDrag({ ...sliceDrag, delta: (event.clientX - sliceDrag.startX + scrolled) / zoom });
+    };
+    const onUp = () => {
+      const pointer = heldPointer.current;
+      const delta = pointer
+        ? (pointer.x -
+            sliceDrag.startX +
+            ((timelineRef.current?.scrollLeft ?? 0) - sliceDrag.startLeft)) /
+          zoom
+        : sliceDrag.delta;
+      heldPointer.current = null;
+      applySliceDrag(sliceDrag, delta);
+      setSliceDrag(null);
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp, { once: true });
+    return () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+    };
+  }, [applySliceDrag, sliceDrag, zoom]);
+
+  const beginSliceBoundaryDrag = (
+    event: ReactPointerEvent<HTMLSpanElement>,
+    clip: Clip,
+    slice: SliceShape,
+    edge: SliceBoundary,
+  ) => {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    event.stopPropagation();
+    setSelectedId(clip.id);
+    setCutsSource("timeline");
+    setSelectedTransition(null);
+    heldPointer.current = { id: event.pointerId, x: event.clientX, y: event.clientY };
+    setSliceDrag({
+      clipId: clip.id,
+      sliceId: slice.id,
+      edge,
+      startX: event.clientX,
+      startLeft: timelineRef.current?.scrollLeft ?? 0,
+      delta: 0,
+      original: clip,
+    });
+  };
+
+  /**
+   * The three fixes a too-tight reveal is allowed to have. Each one is a real
+   * edit the user asked for — nothing here quietly guesses a new schedule.
+   */
+  const sliceFlagAction = (
+    clip: Clip,
+    slice: SliceShape,
+    action: SliceFlagAction,
+    value?: number,
+  ) => {
+    if (action === "drop") {
+      applyClipSlices(
+        clip,
+        (clip.slices ?? []).filter((item) => item.id !== slice.id),
+      );
+      return;
+    }
+    if (action === "widen-cue") {
+      // Crossing the clause break is what lets an earlier cue be borrowed when
+      // the tight one sits too late in its sentence.
+      patchSliceTiming(clip.id, slice.id, {
+        anchorWindow: ANCHOR_WINDOW_SECONDS * 2,
+        crossClause: true,
+      });
+      return;
+    }
+    if (value === undefined) return;
+    patchSliceTiming(clip.id, slice.id, { animation: Math.round(value * 100) / 100 });
   };
 
   /**
@@ -2192,6 +2913,8 @@ function Editor() {
               <GlobalSettings
                 config={project.settings.whiteboard}
                 onChange={updateGlobalWhiteboard}
+                asr={asr}
+                onAsrChange={updateAsr}
               />
               <div className="settings-foot">
                 <span className="settings-count">
@@ -2460,7 +3183,14 @@ function Editor() {
                     // border in the user's order, with the hand leaving the scene
                     // and coming back in between slices.
                     const stageConfig = slices.length
-                      ? makeWhiteboardConfig({ ...animation, style: "slicer", slices })
+                      ? makeWhiteboardConfig({
+                          ...animation,
+                          style: "slicer",
+                          // The clip owns the schedule, so the scene runs for
+                          // exactly the clip's length and seeks frame-for-frame.
+                          timingSeconds: clip.duration,
+                          slices: bandedSlices(clip),
+                        })
                       : animation;
                     return (
                       <WhiteboardStage
@@ -2664,6 +3394,64 @@ function Editor() {
                   {project.tracks.find((track) => track.id === selectedClip.trackId)?.name}
                 </span>
               </div>
+              {selectedClip.mediaType === "audio" && (
+                <div className="whiteboard-controls">
+                  <div className="whiteboard-controls-head">
+                    <span>Narration</span>
+                    <span className="narration-count">
+                      {selectedClip.transcript
+                        ? `${selectedClip.transcript.words.length} words`
+                        : "Not transcribed"}
+                    </span>
+                  </div>
+                  {selectedClip.transcript ? (
+                    <>
+                      <p className="narration-text">{selectedClip.transcript.text}</p>
+                      <p className="whiteboard-hint">
+                        {selectedClip.transcript.duration.toFixed(1)}s ·{" "}
+                        {selectedClip.transcript.chunks}{" "}
+                        {selectedClip.transcript.chunks === 1 ? "chunk" : "chunks"} ·{" "}
+                        {selectedClip.transcript.model ?? "whisper"}
+                      </p>
+                    </>
+                  ) : (
+                    <p className="whiteboard-hint">
+                      Transcribe this narration so image slices can wait for the words that
+                      describe them.
+                    </p>
+                  )}
+                  {asrJob?.clipId === selectedClip.id && (
+                    <p className="narration-status">
+                      <RefreshCw size={12} className="spin" />
+                      {asrJob.total
+                        ? `Transcribing ${asrJob.done} of ${asrJob.total}…`
+                        : "Reading audio…"}
+                    </p>
+                  )}
+                  <div className="narration-actions">
+                    <Button
+                      size="sm"
+                      variant={selectedClip.transcript ? "outline" : "default"}
+                      disabled={asrJob !== null}
+                      onClick={() => void transcribeNarration(selectedClip)}
+                    >
+                      <Captions size={14} />
+                      {selectedClip.transcript ? "Re-transcribe" : "Transcribe"}
+                    </Button>
+                    {selectedClip.transcript && (
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        disabled={asrJob !== null}
+                        onClick={() => updateClip(selectedClip.id, { transcript: undefined })}
+                      >
+                        <Trash2 size={14} /> Clear
+                      </Button>
+                    )}
+                  </div>
+                  {asrError && <p className="narration-error">{asrError}</p>}
+                </div>
+              )}
               {selectedClip.mediaType === "image" && (
                 <div className="whiteboard-controls">
                   <div className="whiteboard-controls-head">
@@ -2748,6 +3536,52 @@ function Editor() {
                       </p>
                     </>
                   )}
+                </div>
+              )}
+              {selectedClip.mediaType === "image" && selectedSlices.length > 0 && (
+                <div className="cue-panel">
+                  <div className="cue-panel-head">
+                    <span>Cue each reveal</span>
+                    <button
+                      type="button"
+                      className="cue-sync"
+                      onClick={() => syncCuesToNarration(selectedClip)}
+                    >
+                      <RefreshCw size={11} /> Sync to narration
+                    </button>
+                  </div>
+                  <p className="whiteboard-hint">
+                    Type the words that should start a reveal. Sync finds them in the
+                    narration under this image.
+                  </p>
+                  <div className="cue-list">
+                    {selectedSlices.map((slice) => {
+                      const visible = cueDrafts[slice.id] ?? slice.cue ?? "";
+                      return (
+                        <label className="cue-row" key={slice.id}>
+                          <span className="cue-number">{slice.number}</span>
+                          <input
+                            className="cue-input"
+                            type="text"
+                            value={visible}
+                            placeholder="words that start this reveal"
+                            aria-label={`Narration cue for slice ${slice.number}`}
+                            onChange={(event) =>
+                              setCueDrafts((current) => ({
+                                ...current,
+                                [slice.id]: event.target.value,
+                              }))
+                            }
+                            onBlur={() => commitSliceCue(selectedClip.id, slice.id, visible)}
+                            onKeyDown={(event) => {
+                              if (event.key === "Enter") event.currentTarget.blur();
+                            }}
+                          />
+                        </label>
+                      );
+                    })}
+                  </div>
+                  {cueStatus && <p className="cue-status">{cueStatus}</p>}
                 </div>
               )}
               <div className="inspector-actions">
@@ -2978,6 +3812,33 @@ function Editor() {
                           <DropdownMenuItem onSelect={() => addTrack(track.category, track.id)}>
                             <Plus size={13} /> Add row
                           </DropdownMenuItem>
+                          {track.category === "video" && (
+                            <DropdownMenuSub>
+                              <DropdownMenuSubTrigger
+                                disabled={!rowsWithUnshippedAudio.has(track.id)}
+                                title={
+                                  rowsWithUnshippedAudio.has(track.id)
+                                    ? "Move this row's audio onto a voice or music row"
+                                    : "No unshipped video audio on this row"
+                                }
+                              >
+                                <VolumeX size={13} /> Audioship
+                              </DropdownMenuSubTrigger>
+                              <DropdownMenuSubContent className="track-menu-content">
+                                <DropdownMenuLabel>Ship audio to</DropdownMenuLabel>
+                                <DropdownMenuItem
+                                  onSelect={() => shipAudioToRow(track.id, "voice")}
+                                >
+                                  <Mic size={13} /> Voice row
+                                </DropdownMenuItem>
+                                <DropdownMenuItem
+                                  onSelect={() => shipAudioToRow(track.id, "music")}
+                                >
+                                  <AudioLines size={13} /> Music row
+                                </DropdownMenuItem>
+                              </DropdownMenuSubContent>
+                            </DropdownMenuSub>
+                          )}
                           {track.kind === "voice" && (
                             <DropdownMenuItem
                               disabled={isRecording && recordingTrackId !== track.id}
@@ -3075,10 +3936,20 @@ function Editor() {
                               width: `${geometry.duration * zoom}px`,
                             }}
                             data-clip-id={clip.id}
-                            title={`${clip.name} · ${geometry.duration.toFixed(2)} sec`}
+                            title={`${clip.name} · ${geometry.duration.toFixed(2)} sec${
+                              clip.audioShipped ? " · audio moved to an audio row" : ""
+                            }`}
                           >
                             <ClipFilmstrip clip={clip} />
-                            {clip.mediaType === "image" && <ClipSlices clip={clip} />}
+                          {clip.mediaType === "image" && (
+                            <ClipSlices
+                              clip={clip}
+                              selected={selectedId === clip.id}
+                              drag={sliceDrag?.clipId === clip.id ? sliceDrag : null}
+                              onBoundaryDrag={beginSliceBoundaryDrag}
+                              onFlagAction={sliceFlagAction}
+                            />
+                          )}
                             <span className="clip-thumb">
                               {clip.mediaType === "image" ? (
                                 <ImageIcon size={13} />
@@ -3091,6 +3962,14 @@ function Editor() {
                             <span className="clip-label">{clip.name}</span>
                             {clip.mediaType !== "image" && (
                               <span className="clip-duration">{geometry.duration.toFixed(1)}s</span>
+                            )}
+                            {clip.audioShipped && (
+                              <span
+                                className="clip-audio-shipped"
+                                title="Audio plays from a separate audio row"
+                              >
+                                <VolumeX size={10} />
+                              </span>
                             )}
                             {clip.mediaType === "audio" && (
                               <span className="waveform" aria-hidden="true">
@@ -3187,6 +4066,7 @@ function Editor() {
           selectedId={selectedSliceId}
           onSelect={setSelectedSliceId}
           onCreate={addSlice}
+          onImportMap={importSliceMap}
           onReorder={reorderSlice}
           onDelete={deleteSlice}
           onClear={clearSlices}
@@ -3467,9 +4347,13 @@ function WhiteboardStyleControls({
 function GlobalSettings({
   config,
   onChange,
+  asr,
+  onAsrChange,
 }: {
   config: WhiteboardConfig;
   onChange: (patch: Partial<WhiteboardConfig>) => void;
+  asr: AsrConfig;
+  onAsrChange: (patch: Partial<AsrConfig>) => void;
 }) {
   return (
     <div className="settings-fields global-settings-fields">
@@ -3567,6 +4451,49 @@ function GlobalSettings({
         step="1"
         value={config.speed}
         onChange={(event) => onChange({ speed: Number(event.target.value) })}
+      />
+
+      <div className="settings-divider" />
+      <span className="settings-eyebrow">NARRATION</span>
+      <p className="settings-note">
+        Audio is transcribed by your own Cloudflare Worker. This token stays in this
+        browser and is never written into the project.
+      </p>
+      <label className="field-label" htmlFor="asr-endpoint">
+        Worker URL
+      </label>
+      <input
+        id="asr-endpoint"
+        className="editor-input"
+        type="url"
+        spellCheck={false}
+        value={asr.endpoint}
+        placeholder="https://cutline-asr.example.workers.dev"
+        onChange={(event) => onAsrChange({ endpoint: event.target.value })}
+      />
+      <label className="field-label" htmlFor="asr-token">
+        Access token <span>optional</span>
+      </label>
+      <input
+        id="asr-token"
+        className="editor-input"
+        type="password"
+        autoComplete="off"
+        value={asr.token}
+        placeholder="Only if the worker has a SHARED_SECRET"
+        onChange={(event) => onAsrChange({ token: event.target.value })}
+      />
+      <label className="field-label" htmlFor="asr-language">
+        Language
+      </label>
+      <input
+        id="asr-language"
+        className="editor-input"
+        type="text"
+        spellCheck={false}
+        value={asr.language}
+        placeholder="en"
+        onChange={(event) => onAsrChange({ language: event.target.value })}
       />
     </div>
   );
