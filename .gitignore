@@ -16,6 +16,9 @@ dist-ssr
 .nitro
 *.local
 
+# Temporary fixtures used while iterating on the whiteboard preview
+public/.seed/
+
 # Wrangler / Cloudflare
 .wrangler/
 .dev.vars
