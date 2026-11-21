@@ -6,6 +6,7 @@ import {
   resolveSliceTiming,
   resolveTriggerAnchor,
   timingBands,
+  transcriptHasPhrase,
   type TranscriptWord,
 } from "@/lib/slice-timing";
 
@@ -22,6 +23,18 @@ describe("slice timing schedule", () => {
     near(defaults[0]?.animation ?? 0, naturalSliceAnimation());
     near(defaults[1]?.animation ?? 0, naturalSliceAnimation());
     expect(defaults[1]?.intendedStart ?? 0).toBeGreaterThan(defaults[0]?.intendedStart ?? 0);
+  });
+
+  it("surfaces an estimated placement as its own flag", () => {
+    const { slices } = resolveSliceTiming(
+      [
+        { id: "a", timing: { intendedStart: 0, animation: 1 } },
+        { id: "b", timing: { intendedStart: 1.5, anchorStart: 1.5, animation: 1, estimated: true } },
+      ],
+      6,
+    );
+    expect(slices[1]?.flags).toContain("estimated");
+    expect(slices[0]?.flags).not.toContain("estimated");
   });
 
   it("keeps reveals sequential and derives hold up to the next start", () => {
@@ -243,5 +256,27 @@ describe("trigger anchor resolution", () => {
     const resolution = resolveTriggerAnchor(script, "stop", 0, 0);
     expect(resolution?.clamped).toBe(true);
     near(resolution?.anchor.time ?? -1, 0);
+  });
+});
+
+describe("transcript phrase check", () => {
+  const spoken = words([
+    ["Most", 0, 0.2],
+    ["teams", 0.2, 0.4],
+    ["start", 0.4, 0.6],
+    ["with", 0.6, 0.7],
+    ["a", 0.7, 0.75],
+    ["mess,", 0.75, 1],
+  ]);
+
+  it("accepts a verbatim phrase, ignoring case and punctuation", () => {
+    expect(transcriptHasPhrase(spoken, "teams start with a mess")).toBe(true);
+    expect(transcriptHasPhrase(spoken, "Most teams")).toBe(true);
+  });
+
+  it("rejects words that were never spoken or are out of order", () => {
+    expect(transcriptHasPhrase(spoken, "start teams")).toBe(false);
+    expect(transcriptHasPhrase(spoken, "teams begin")).toBe(false);
+    expect(transcriptHasPhrase(spoken, "   ")).toBe(false);
   });
 });

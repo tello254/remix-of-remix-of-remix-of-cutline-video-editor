@@ -1,398 +1,536 @@
 /**
- * Reads slice borders authored outside the editor.
+ * Slice maps: the bridge between an image authored elsewhere and the slicer.
  *
- * The whiteboard engine paints each slice by clipping the image to a polygon,
- * so the only thing a slice map has to provide is geometry plus intent: which
- * polygon, in what order, triggered by which words. It never carries time —
- * seconds come from the narration, not from the model that drew the map.
+ * A model (or an annotation tool) emits polygons around the parts of a picture
+ * that should appear one at a time. This module is the only place that decides
+ * whether such a map is usable. It is deliberately strict: a map either turns
+ * into every slice it described, or it is rejected with reasons. Nothing is
+ * clamped, dropped, or reordered silently, because a quietly moved polygon
+ * produces a video that is wrong in a way nobody can see while editing.
  *
- * Parsing is deliberately strict. A coordinate outside the image, a polygon
- * with two points, or a self-intersecting border is reported with the path that
- * caused it and the whole map is rejected. Clamping bad geometry would silently
- * paint the wrong part of the picture, which is worse than refusing the import.
+ * Coordinates are normalised to the image (0–1, origin top-left) unless a slice
+ * explicitly declares pixel space together with the image's dimensions.
  */
 
+import {
+  MIN_POLYGON_AREA,
+  MIN_SLICE_POINTS,
+  ensureMinimumPoints,
+  isSelfIntersecting,
+  signedPolygonArea,
+  type SliceGeometryPoint,
+} from "@/lib/slice-geometry";
+
+export type SliceMapPoint = SliceGeometryPoint;
+
+/** Re-exported so callers validating their own geometry share one rule. */
+export { isSelfIntersecting };
+
+export type SliceMapSpace = "normalized" | "pixels";
+
+/** The one schema string Cutline writes and ChatGPT is asked to produce. */
 export const SLICE_MAP_SCHEMA = "cutline.slice-map/1";
 
-export type SliceMapPoint = { x: number; y: number };
-
-export type SliceMapSlice = {
-  /** Polygon in image space, normalised to 0..1. */
-  points: SliceMapPoint[];
-  /** 1-based position in the animation sequence. */
+export type ParsedSlice = {
+  /** 1-based animation position, always a contiguous 1..N. */
   order: number;
-  /** Words that should start this reveal, copied from the script. */
-  cue?: string | undefined;
+  /** Permanent slice label, kept apart from `order` so reordering is reversible. */
+  number: number;
+  /** Optional narration phrase; the scheduler turns it into a time later. */
+  cue?: string;
+  points: SliceMapPoint[];
 };
 
-export type SliceMapIssue = {
-  /** JSON-ish path, e.g. `slices[2].points`. */
-  path: string;
-  message: string;
-};
-
-export type SliceMapOverlap = { a: number; b: number };
+/** A single rejection or warning, addressed so the UI can point at the field. */
+export type SliceMapIssue = { path: string; message: string };
 
 export type SliceMapReport = {
-  slices: SliceMapSlice[];
+  slices: ParsedSlice[];
   errors: SliceMapIssue[];
   warnings: SliceMapIssue[];
-  /** Fraction of the image covered by at least one slice, 0..1. */
+  /** The space the map was authored in, after defaults were applied. */
+  space: SliceMapSpace;
+  /**
+   * Share of the image covered by at least one slice (0–1). Sampled on a grid,
+   * so it is a review figure rather than an exact geometric area.
+   */
   coverage: number;
-  /** Pairs of slice numbers whose areas overlap. */
-  overlaps: SliceMapOverlap[];
 };
 
 export type ParseSliceMapOptions = {
-  /** How bare coordinates should be read. Defaults to `normalized`. */
-  space?: "normalized" | "pixels";
-  width?: number;
-  height?: number;
+  /** Used when neither the map nor a slice declares a space. */
+  defaultSpace?: SliceMapSpace;
+  /**
+   * The image being sliced. A bundle that describes several images is matched
+   * on its `file`/`name`, so pasting the whole bundle imports the right scene
+   * instead of whichever one happened to be first.
+   */
+  fileName?: string | undefined;
 };
 
-const EPSILON = 1e-6;
-/** 0.01% of the image. Smaller than this is a click, not a region. */
-const MIN_AREA = 1e-4;
-const GRID_COLUMNS = 64;
-const GRID_ROWS = 36;
+const EPSILON = 1e-9;
+/** Grid resolution used to estimate how much of the picture is sliced. */
+const COVERAGE_GRID = 128;
+/** Fields a model tends to invent; Cutline measures all of these itself. */
+const TIMING_KEYS = [
+  "start",
+  "startSeconds",
+  "intendedStart",
+  "duration",
+  "durationSeconds",
+  "animation",
+  "hold",
+  "lag",
+  "timing",
+];
 
-function asRecord(value: unknown): Record<string, unknown> | null {
-  return value !== null && typeof value === "object" && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : null;
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-function issue(path: string, message: string): SliceMapIssue {
-  return { path, message };
+function asNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
-/** Accepts a bare array, `{ slices }`, `{ beats }`, or a single scene of a bundle. */
-function extractEntries(input: unknown): { entries: unknown[]; path: string } | null {
-  if (Array.isArray(input)) return { entries: input, path: "$" };
-  const root = asRecord(input);
-  if (!root) return null;
+function readPositive(value: unknown): number | null {
+  const number = asNumber(value);
+  return number !== null && number > 0 ? number : null;
+}
 
-  if (Array.isArray(root["slices"])) return { entries: root["slices"], path: "$.slices" };
-  if (Array.isArray(root["beats"])) return { entries: root["beats"], path: "$.beats" };
-
-  const scenes = root["scenes"];
-  if (Array.isArray(scenes)) {
-    for (let index = 0; index < scenes.length; index += 1) {
-      const scene = asRecord(scenes[index]);
-      if (!scene) continue;
-      const inner = Array.isArray(scene["beats"]) ? scene["beats"] : scene["slices"];
-      if (Array.isArray(inner)) return { entries: inner, path: `$.scenes[${index}]` };
-    }
-  }
-
-  const scene = asRecord(root["scene"]);
-  if (scene) {
-    const inner = Array.isArray(scene["beats"]) ? scene["beats"] : scene["slices"];
-    if (Array.isArray(inner)) return { entries: inner, path: "$.scene" };
-  }
-
+function readSpace(value: unknown): SliceMapSpace | null {
+  if (value === undefined || value === null) return null;
+  if (value === "normalized" || value === "norm") return "normalized";
+  if (value === "pixels" || value === "pixel" || value === "px") return "pixels";
   return null;
 }
 
-function readPoint(raw: unknown): SliceMapPoint | null {
-  if (Array.isArray(raw)) {
-    const x = raw[0];
-    const y = raw[1];
-    return typeof x === "number" && typeof y === "number" ? { x, y } : null;
-  }
-  const record = asRecord(raw);
-  if (!record) return null;
-  const x = record["x"];
-  const y = record["y"];
-  return typeof x === "number" && typeof y === "number" ? { x, y } : null;
-}
+type PointRead = { points: SliceMapPoint[] } | { error: string };
 
-function areaOf(points: SliceMapPoint[]): number {
-  let total = 0;
-  for (let index = 0; index < points.length; index += 1) {
-    const a = points[index]!;
-    const b = points[(index + 1) % points.length]!;
-    total += a.x * b.y - b.x * a.y;
-  }
-  return Math.abs(total) / 2;
-}
+function readPoints(raw: unknown): PointRead {
+  if (!Array.isArray(raw)) return { error: "points must be an array" };
+  if (raw.length < 3) return { error: `needs at least 3 points, found ${raw.length}` };
 
-function orientation(a: SliceMapPoint, b: SliceMapPoint, c: SliceMapPoint) {
-  return (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
-}
+  const points: SliceMapPoint[] = [];
+  for (let index = 0; index < raw.length; index += 1) {
+    const entry = raw[index];
+    let x: number | null = null;
+    let y: number | null = null;
 
-/** True for a proper crossing; touching corners are tolerated. */
-function segmentsCross(a: SliceMapPoint, b: SliceMapPoint, c: SliceMapPoint, d: SliceMapPoint) {
-  const o1 = orientation(a, b, c);
-  const o2 = orientation(a, b, d);
-  const o3 = orientation(c, d, a);
-  const o4 = orientation(c, d, b);
-  return (
-    ((o1 > EPSILON && o2 < -EPSILON) || (o1 < -EPSILON && o2 > EPSILON)) &&
-    ((o3 > EPSILON && o4 < -EPSILON) || (o3 < -EPSILON && o4 > EPSILON))
-  );
-}
-
-function selfIntersects(points: SliceMapPoint[]): boolean {
-  const count = points.length;
-  for (let i = 0; i < count; i += 1) {
-    const a = points[i]!;
-    const b = points[(i + 1) % count]!;
-    for (let j = i + 1; j < count; j += 1) {
-      // Adjacent edges share a corner by design, and so do the first and last.
-      if (j === i || j === (i + 1) % count || (i === 0 && j === count - 1)) continue;
-      const c = points[j]!;
-      const d = points[(j + 1) % count]!;
-      if (segmentsCross(a, b, c, d)) return true;
+    if (Array.isArray(entry)) {
+      x = asNumber(entry[0]);
+      y = asNumber(entry[1]);
+    } else if (isRecord(entry)) {
+      x = asNumber(entry["x"]);
+      y = asNumber(entry["y"]);
     }
+
+    if (x === null || y === null) {
+      return { error: `point ${index + 1} is not a pair of numbers` };
+    }
+    points.push({ x, y });
   }
-  return false;
+  return { points };
 }
 
-function insidePolygon(points: SliceMapPoint[], x: number, y: number): boolean {
+/** Even-odd containment test, used only for the coverage estimate. */
+function pointInPolygon(x: number, y: number, points: SliceMapPoint[]) {
   let inside = false;
   for (let i = 0, j = points.length - 1; i < points.length; j = i, i += 1) {
     const a = points[i]!;
     const b = points[j]!;
-    if ((a.y > y) !== (b.y > y) && x < ((b.x - a.x) * (y - a.y)) / (b.y - a.y) + a.x) {
-      inside = !inside;
+    if (a.y > y !== b.y > y) {
+      const crossing = ((b.x - a.x) * (y - a.y)) / (b.y - a.y) + a.x;
+      if (x < crossing) inside = !inside;
     }
   }
   return inside;
 }
 
-function measure(slices: SliceMapSlice[]) {
-  const cells = GRID_COLUMNS * GRID_ROWS;
-  let covered = 0;
-  const overlaps = new Map<string, SliceMapOverlap>();
-
-  if (!slices.length) return { coverage: 0, overlaps: [] };
-
-  for (let row = 0; row < GRID_ROWS; row += 1) {
-    const y = (row + 0.5) / GRID_ROWS;
-    for (let column = 0; column < GRID_COLUMNS; column += 1) {
-      const x = (column + 0.5) / GRID_COLUMNS;
-      const hits: number[] = [];
-      for (let index = 0; index < slices.length; index += 1) {
-        if (insidePolygon(slices[index]!.points, x, y)) hits.push(index + 1);
-      }
-      if (hits.length) covered += 1;
-      for (let i = 0; i < hits.length; i += 1) {
-        for (let j = i + 1; j < hits.length; j += 1) {
-          const a = hits[i]!;
-          const b = hits[j]!;
-          overlaps.set(`${a}-${b}`, { a, b });
-        }
-      }
+function coveredFraction(slices: ParsedSlice[]) {
+  if (!slices.length) return 0;
+  let hits = 0;
+  for (let row = 0; row < COVERAGE_GRID; row += 1) {
+    const y = (row + 0.5) / COVERAGE_GRID;
+    for (let column = 0; column < COVERAGE_GRID; column += 1) {
+      const x = (column + 0.5) / COVERAGE_GRID;
+      if (slices.some((slice) => pointInPolygon(x, y, slice.points))) hits += 1;
     }
   }
-
-  return {
-    coverage: covered / cells,
-    overlaps: [...overlaps.values()].sort((left, right) => left.a - right.a || left.b - right.b),
-  };
+  return hits / (COVERAGE_GRID * COVERAGE_GRID);
 }
 
 /**
- * Parses a slice map. Geometry errors empty `slices`, so a caller can decide to
- * import nothing rather than half a picture. Warnings never block.
+ * The slice list inside one entry, under any of the names accepted so far.
+ * `beats` comes from a video bundle, while `slices` is what Cutline writes.
+ */
+function sliceListOf(entry: unknown): unknown {
+  if (!isRecord(entry)) return undefined;
+  return entry["slices"] ?? entry["regions"] ?? entry["beats"];
+}
+
+/** Compares image names by their file part, ignoring case and folders. */
+function sameFileName(candidate: unknown, wanted: string) {
+  if (typeof candidate !== "string") return false;
+  const normalise = (value: string) => value.trim().toLowerCase().replace(/^.*[\\/]/, "");
+  return normalise(candidate) === normalise(wanted);
+}
+
+/**
+ * Parses a slice map and returns either every slice or every reason it was
+ * rejected. The result is atomic on purpose: a partial import would look like
+ * success while leaving some regions permanently unpainted.
  */
 export function parseSliceMap(
-  input: unknown,
+  input: string | unknown,
   options?: ParseSliceMapOptions,
 ): SliceMapReport {
   const errors: SliceMapIssue[] = [];
   const warnings: SliceMapIssue[] = [];
-
-  let raw: unknown = input;
-  if (typeof input === "string") {
-    try {
-      raw = JSON.parse(input);
-    } catch {
-      errors.push(issue("$", "This is not valid JSON."));
-      return { slices: [], errors, warnings, coverage: 0, overlaps: [] };
-    }
-  }
-
-  const extracted = extractEntries(raw);
-  if (!extracted) {
-    errors.push(
-      issue("$", "Expected a list of slices, or an object with `slices`, `beats` or `scenes`."),
-    );
-    return { slices: [], errors, warnings, coverage: 0, overlaps: [] };
-  }
-
-  const slices: SliceMapSlice[] = [];
-  const usedOrders = new Set<number>();
-
-  const claimOrder = (preferred: number) => {
-    let order = Math.max(1, Math.round(preferred));
-    while (usedOrders.has(order)) order += 1;
-    usedOrders.add(order);
-    return order;
-  };
-
-  extracted.entries.forEach((entry, index) => {
-    const path = `${extracted.path}[${index}]`;
-    const record = asRecord(entry);
-    if (!record) {
-      errors.push(issue(path, "Each slice must be an object."));
-      return;
-    }
-
-    const holder = asRecord(record["slice"]) ?? record;
-    const rawPoints = holder["points"] ?? record["points"];
-    if (!Array.isArray(rawPoints)) {
-      errors.push(issue(`${path}.points`, "Missing a `points` array."));
-      return;
-    }
-
-    const space =
-      (holder["space"] as string | undefined) ??
-      (record["space"] as string | undefined) ??
-      options?.space ??
-      "normalized";
-    if (space !== "normalized" && space !== "pixels") {
-      errors.push(issue(`${path}.space`, 'Use `"normalized"` or `"pixels"`.'));
-      return;
-    }
-
-    const width = Number(holder["width"] ?? record["width"] ?? options?.width);
-    const height = Number(holder["height"] ?? record["height"] ?? options?.height);
-    if (space === "pixels" && !(width > 0 && height > 0)) {
-      errors.push(
-        issue(
-          `${path}.points`,
-          "Pixel coordinates need the image size: add `width` and `height` next to the points.",
-        ),
-      );
-      return;
-    }
-
-    const points: SliceMapPoint[] = [];
-    let pointError = false;
-    rawPoints.forEach((rawPoint, pointIndex) => {
-      const point = readPoint(rawPoint);
-      if (!point || !Number.isFinite(point.x) || !Number.isFinite(point.y)) {
-        errors.push(
-          issue(
-            `${path}.points[${pointIndex}]`,
-            "Use `[x, y]` or `{ \"x\": number, \"y\": number }`.",
-          ),
-        );
-        pointError = true;
-        return;
-      }
-      const x = space === "pixels" ? point.x / width : point.x;
-      const y = space === "pixels" ? point.y / height : point.y;
-      if (x < -EPSILON || x > 1 + EPSILON || y < -EPSILON || y > 1 + EPSILON) {
-        errors.push(
-          issue(
-            `${path}.points[${pointIndex}]`,
-            space === "pixels"
-              ? `Point (${point.x}, ${point.y}) is outside the ${width}×${height} image.`
-              : `Point (${point.x}, ${point.y}) must be between 0 and 1; scale it, or set "space": "pixels" with width and height.`,
-          ),
-        );
-        pointError = true;
-        return;
-      }
-      const previous = points[points.length - 1];
-      const clamped = {
-        x: Math.min(1, Math.max(0, x)),
-        y: Math.min(1, Math.max(0, y)),
-      };
-      if (previous && Math.hypot(previous.x - clamped.x, previous.y - clamped.y) < EPSILON) {
-        warnings.push(issue(`${path}.points[${pointIndex}]`, "Duplicate point skipped."));
-        return;
-      }
-      points.push(clamped);
-    });
-    if (pointError) return;
-
-    if (points.length >= 2) {
-      const first = points[0]!;
-      const last = points[points.length - 1]!;
-      if (Math.hypot(first.x - last.x, first.y - last.y) < EPSILON) points.pop();
-    }
-
-    if (points.length < 3) {
-      errors.push(issue(`${path}.points`, "A slice needs at least three corners."));
-      return;
-    }
-    // A bowtie has two lobes whose signed areas cancel, so this has to run
-    // before the area check or it reads as "no visible area" instead.
-    if (selfIntersects(points)) {
-      errors.push(
-        issue(`${path}.points`, "This border crosses itself; draw one simple polygon."),
-      );
-      return;
-    }
-    if (areaOf(points) < MIN_AREA) {
-      errors.push(issue(`${path}.points`, "This polygon has no visible area."));
-      return;
-    }
-
-    const rawOrder = record["order"] ?? holder["order"];
-    const preferred =
-      typeof rawOrder === "number" && Number.isFinite(rawOrder) ? rawOrder : index + 1;
-    if (typeof rawOrder === "number" && usedOrders.has(Math.max(1, Math.round(rawOrder)))) {
-      warnings.push(
-        issue(`${path}.order`, `Order ${Math.round(rawOrder)} is already taken; moved to the next free position.`),
-      );
-    }
-    const order = claimOrder(preferred);
-
-    const rawCue = record["cue"] ?? record["trigger"] ?? record["phrase"] ?? holder["cue"];
-    const cue = typeof rawCue === "string" ? rawCue.replace(/\s+/g, " ").trim() : "";
-    if (cue.length > 120) {
-      warnings.push(issue(`${path}.cue`, "A cue longer than 120 characters is hard to match."));
-    }
-
-    slices.push({ points, order, ...(cue ? { cue } : {}) });
+  const empty = (space: SliceMapSpace): SliceMapReport => ({
+    slices: [],
+    errors,
+    warnings,
+    space,
+    coverage: 0,
   });
 
-  if (!slices.length && !errors.length) {
-    errors.push(issue(extracted.path, "The map does not contain any slices."));
+  let value: unknown = input;
+  if (typeof input === "string") {
+    if (!input.trim()) {
+      errors.push({ path: "map", message: "The slice map is empty." });
+      return empty(options?.defaultSpace ?? "normalized");
+    }
+    try {
+      value = JSON.parse(input);
+    } catch (error) {
+      errors.push({
+        path: "map",
+        message: `That is not valid JSON: ${
+          error instanceof Error ? error.message : "parse failed"
+        }`,
+      });
+      return empty(options?.defaultSpace ?? "normalized");
+    }
   }
 
-  // All or nothing: importing the good half of a map would leave the image
-  // painted in a shape nobody asked for. Callers check `errors` first anyway.
-  const accepted = errors.length ? [] : slices;
-  const { coverage, overlaps } = measure(accepted);
-  if (slices.length && coverage < 0.5) {
-    warnings.push(
-      issue(
-        "$",
-        `These slices cover ${Math.round(coverage * 100)}% of the image; the rest is never drawn.`,
-      ),
-    );
-  }
-  for (const overlap of overlaps) {
-    warnings.push(
-      issue("$", `Slices ${overlap.a} and ${overlap.b} overlap; both will paint the same pixels.`),
-    );
+  let root: Record<string, unknown> | null = null;
+  /** The image/scene entry that owns the slices, when the map is a bundle. */
+  let container: Record<string, unknown> | null = null;
+  let rawSlices: unknown;
+  if (Array.isArray(value)) {
+    rawSlices = value;
+  } else if (isRecord(value)) {
+    root = value;
+    rawSlices = sliceListOf(value);
+
+    // A bundle of images is what the master prompt asks a model to produce:
+    // { schema, images: [{ file, scene, slices }] }. Import the entry for the
+    // image that is open, so a whole-project map can be pasted scene by scene.
+    const images = value["images"];
+    if (rawSlices === undefined && Array.isArray(images)) {
+      const described = images.filter((entry) => Array.isArray(sliceListOf(entry)));
+      const wanted = options?.fileName;
+      const selected = wanted
+        ? (described.find((entry) => sameFileName(entry["file"] ?? entry["name"], wanted)) ??
+          described[0])
+        : described[0];
+      if (selected) {
+        container = selected;
+        rawSlices = sliceListOf(selected);
+      }
+      if (described.length > 1) {
+        const label =
+          selected && typeof (selected["file"] ?? selected["name"]) === "string"
+            ? String(selected["file"] ?? selected["name"])
+            : "the first image";
+        warnings.push({
+          path: "images",
+          message: `This map describes ${described.length} images; imported the slices for ${label}.`,
+        });
+      }
+    }
+
+    if (rawSlices === undefined && Array.isArray(value["scenes"])) {
+      const scene = value["scenes"].find((entry) => Array.isArray(sliceListOf(entry)));
+      if (isRecord(scene)) {
+        container = scene;
+        rawSlices = sliceListOf(scene);
+      }
+    }
+
+    if (rawSlices === undefined && isRecord(value["scene"])) {
+      container = value["scene"];
+      rawSlices = sliceListOf(container);
+    }
+  } else {
+    errors.push({
+      path: "map",
+      message:
+        "Expected an object with a `slices` array, or a bare array of slices. A bundle with `images` works too.",
+    });
+    return empty(options?.defaultSpace ?? "normalized");
   }
 
-  return { slices: accepted, errors, warnings, coverage, overlaps };
+  if (!Array.isArray(rawSlices)) {
+    errors.push({ path: "slices", message: "The slice map needs a `slices` array." });
+    return empty(options?.defaultSpace ?? "normalized");
+  }
+  if (rawSlices.length === 0) {
+    errors.push({ path: "slices", message: "The slice map contains no slices." });
+    return empty(options?.defaultSpace ?? "normalized");
+  }
+
+  // Space and pixel size may live on the bundle, the chosen image, or a slice.
+  const meta = container ?? root;
+  const rootSpace = readSpace(meta?.["space"]) ?? readSpace(root?.["space"]);
+  if (meta && meta["space"] !== undefined && rootSpace === null) {
+    warnings.push({
+      path: "space",
+      message: `Unknown space "${String(meta["space"])}"; using ${
+        options?.defaultSpace ?? "normalized"
+      }.`,
+    });
+  }
+  const space = rootSpace ?? options?.defaultSpace ?? "normalized";
+  const rootWidth = readPositive(meta?.["width"]) ?? readPositive(root?.["width"]);
+  const rootHeight = readPositive(meta?.["height"]) ?? readPositive(root?.["height"]);
+
+  const seenOrders = new Set<number>();
+  const seenNumbers = new Set<number>();
+  const parsed: {
+    order: number;
+    number?: number | undefined;
+    cue?: string | undefined;
+    points: SliceMapPoint[];
+  }[] = [];
+
+  rawSlices.forEach((entry, index) => {
+    const path = `slices[${index}]`;
+    if (!isRecord(entry)) {
+      errors.push({ path, message: "expected an object." });
+      return;
+    }
+
+    for (const key of TIMING_KEYS) {
+      if (entry[key] !== undefined) {
+        warnings.push({
+          path: `${path}.${key}`,
+          message: `"${key}" is ignored — Cutline measures timing from the narration.`,
+        });
+      }
+    }
+
+    const sliceSpace = readSpace(entry["space"]) ?? space;
+    const width = readPositive(entry["width"]) ?? rootWidth;
+    const height = readPositive(entry["height"]) ?? rootHeight;
+
+    const read = readPoints(entry["points"] ?? entry["polygon"]);
+    if ("error" in read) {
+      errors.push({ path: `${path}.points`, message: `${read.error}.` });
+      return;
+    }
+
+    let points = read.points;
+    if (sliceSpace === "pixels") {
+      if (width === null || height === null) {
+        errors.push({
+          path: `${path}.points`,
+          message: 'pixel coordinates need "width" and "height" on the slice or the map.',
+        });
+        return;
+      }
+      points = points.map((point) => ({ x: point.x / width, y: point.y / height }));
+    } else {
+      const outside = points.some(
+        (point) =>
+          point.x < -EPSILON ||
+          point.x > 1 + EPSILON ||
+          point.y < -EPSILON ||
+          point.y > 1 + EPSILON,
+      );
+      if (outside) {
+        const looksLikePercent = points.some(
+          (point) => Math.abs(point.x) > 1 + EPSILON || Math.abs(point.y) > 1 + EPSILON,
+        );
+        errors.push({
+          path: `${path}.points`,
+          message: `coordinates must be 0–1.${
+            looksLikePercent ? " These look like percentages — divide by 100." : ""
+          }`,
+        });
+        return;
+      }
+    }
+
+    const area = Math.abs(signedPolygonArea(points));
+    if (isSelfIntersecting(points)) {
+      // A crossed border still paints (the engine fills it even-odd), and a
+      // freehand stroke can easily double back on itself. Rejecting it would
+      // make Cutline's own exported maps impossible to re-import, so this is
+      // reported and the user can untangle it with the handles.
+      warnings.push({
+        path: `${path}.points`,
+        message:
+          "the polygon's edges cross themselves, so it paints with a gap — drag the handles to untangle it.",
+      });
+    }
+    if (area < MIN_POLYGON_AREA) {
+      errors.push({
+        path: `${path}.points`,
+        message: `the polygon is too thin or flat to paint (area ${area.toFixed(5)}).`,
+      });
+      return;
+    }
+
+    // A border the user can only look at is a border they cannot fix. Fewer
+    // corners than the editing minimum are topped up on their longest edges,
+    // which adds handles without moving a single edge.
+    const topped = ensureMinimumPoints(points);
+    if (topped.added > 0) {
+      warnings.push({
+        path: `${path}.points`,
+        message: `added ${topped.added} point${topped.added === 1 ? "" : "s"} on the longest edge${
+          topped.added === 1 ? "" : "s"
+        } so this border has ${MIN_SLICE_POINTS} draggable points — the shape is unchanged.`,
+      });
+      points = topped.points;
+    }
+
+    const rawOrder = entry["order"] ?? entry["position"];
+    let order = 0;
+    if (rawOrder !== undefined && rawOrder !== null) {
+      const number = asNumber(rawOrder);
+      if (number === null || !Number.isInteger(number) || number < 1) {
+        errors.push({
+          path: `${path}.order`,
+          message: '"order" must be a whole number starting at 1.',
+        });
+        return;
+      }
+      if (seenOrders.has(number)) {
+        errors.push({
+          path: `${path}.order`,
+          message: `order ${number} is used by another slice.`,
+        });
+        return;
+      }
+      seenOrders.add(number);
+      order = number;
+    }
+
+    const rawCue = entry["cue"] ?? entry["trigger"] ?? entry["phrase"];
+    let cue: string | undefined;
+    if (rawCue !== undefined && rawCue !== null) {
+      if (typeof rawCue !== "string") {
+        errors.push({ path: `${path}.cue`, message: '"cue" must be text.' });
+        return;
+      }
+      cue = rawCue.replace(/\s+/g, " ").trim() || undefined;
+    }
+
+    // `number` is the slice's permanent label, separate from its play order.
+    // Honouring it makes an exported-then-reimported map keep the same names.
+    const rawNumber = entry["number"] ?? entry["sliceNumber"];
+    let number: number | undefined;
+    if (rawNumber !== undefined && rawNumber !== null) {
+      const value = asNumber(rawNumber);
+      if (value === null || !Number.isInteger(value) || value < 1) {
+        warnings.push({
+          path: `${path}.number`,
+          message: '"number" must be a whole number starting at 1; using the list position instead.',
+        });
+      } else if (seenNumbers.has(value)) {
+        warnings.push({
+          path: `${path}.number`,
+          message: `slice number ${value} appears twice; using the list position for this one.`,
+        });
+      } else {
+        seenNumbers.add(value);
+        number = value;
+      }
+    }
+
+    parsed.push({ order: order || index + 1, number, cue, points });
+  });
+
+  if (errors.length) return empty(space);
+
+  const explicitOrders = parsed.filter((slice) => seenOrders.has(slice.order));
+  if (explicitOrders.length && explicitOrders.length !== parsed.length) {
+    warnings.push({
+      path: "slices",
+      message: "Only some slices had an order; the rest keep the file's own order.",
+    });
+  }
+
+  // Compact whatever came in into a contiguous 1..N while keeping the relative
+  // order the author chose. This is where "order 10, 20, 30" becomes 1, 2, 3.
+  const ordered = [...parsed].sort((a, b) => a.order - b.order);
+  const slices = ordered.map((slice, index) => ({
+    order: index + 1,
+    number: slice.number ?? index + 1,
+    ...(slice.cue ? { cue: slice.cue } : {}),
+    points: slice.points,
+  }));
+
+  if (ordered.some((slice, index) => slice.order !== index + 1)) {
+    warnings.push({
+      path: "slices",
+      message: `Orders were compacted to 1–${slices.length}.`,
+    });
+  }
+
+  return { slices, errors, warnings, space, coverage: coveredFraction(slices) };
 }
 
-/** Writes the current slices back out in the same shape the parser accepts. */
+export type SerializeSliceMapOptions = {
+  pretty?: boolean;
+  /** 1-based play position of this image on the timeline. */
+  image?: number | undefined;
+  /** The image's file or library name. */
+  file?: string | undefined;
+  /** One line describing the scene, when the caller has one. */
+  scene?: string | undefined;
+};
+
+/**
+ * The inverse of `parseSliceMap`, in the same bundle shape the master prompt
+ * asks a model to write:
+ *
+ *   { schema, space, images: [{ image, file, slices: [{ number, order, cue, points }] }] }
+ *
+ * Everything the manual workflow decided is preserved — the borders and their
+ * points, which slice is which, the play order, and the trigger phrase — so the
+ * work can be handed to another image, another chat, or back into Cutline.
+ * Timing is still intentionally absent: it belongs to the audio.
+ */
 export function serializeSliceMap(
-  slices: { points: SliceMapPoint[]; order?: number; cue?: string | undefined }[],
-): string {
+  slices: {
+    order: number;
+    number?: number | undefined;
+    cue?: string | undefined;
+    points: SliceMapPoint[];
+  }[],
+  options?: SerializeSliceMapOptions,
+) {
   const round = (value: number) => Math.round(value * 10000) / 10000;
-  return JSON.stringify(
-    {
-      schema: SLICE_MAP_SCHEMA,
-      slices: slices.map((slice, index) => ({
-        number: index + 1,
-        order: slice.order ?? index + 1,
-        ...(slice.cue ? { cue: slice.cue } : {}),
-        points: slice.points.map((point) => [round(point.x), round(point.y)]),
-      })),
-    },
-    null,
-    2,
-  );
+  const ordered = [...slices].sort((a, b) => a.order - b.order);
+  const map = {
+    schema: SLICE_MAP_SCHEMA,
+    space: "normalized" as const,
+    images: [
+      {
+        ...(options?.image ? { image: options.image } : {}),
+        ...(options?.file ? { file: options.file } : {}),
+        ...(options?.scene ? { scene: options.scene } : {}),
+        slices: ordered.map((slice, index) => ({
+          number: slice.number ?? index + 1,
+          order: slice.order,
+          ...(slice.cue ? { cue: slice.cue } : {}),
+          points: slice.points.map((point) => [round(point.x), round(point.y)]),
+        })),
+      },
+    ],
+  };
+  return JSON.stringify(map, null, options?.pretty === false ? 0 : 2);
 }

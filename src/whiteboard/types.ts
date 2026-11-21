@@ -116,6 +116,11 @@ export type SliceShape = {
     /** Widened cue search, set by the "too tight" fix. */
     anchorWindow?: number | null;
     crossClause?: boolean | null;
+    /**
+     * Set when the slice's words were not found and its place was fitted
+     * between its neighbours. Surfaced as an `estimated` badge.
+     */
+    estimated?: boolean | null;
   };
 };
 

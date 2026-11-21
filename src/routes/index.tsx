@@ -10,6 +10,7 @@ import {
   Eye,
   EyeOff,
   Film,
+  Flag,
   Globe,
   Image as ImageIcon,
   LibraryBig,
@@ -25,7 +26,9 @@ import {
   RefreshCw,
   Scissors,
   SlidersHorizontal,
+  Sparkles,
   Trash2,
+  TriangleAlert,
   Undo2,
   Upload,
   Video,
@@ -61,21 +64,33 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Sheet, SheetContent, SheetHeader, SheetTitle, SheetTrigger } from "@/components/ui/sheet";
-import { loadAsrConfig, saveAsrConfig, type AsrConfig } from "@/lib/asr-config";
+import {
+  ASR_LANGUAGES,
+  DEFAULT_ASR_ENDPOINT,
+  loadAsrConfig,
+  saveAsrConfig,
+  type AsrConfig,
+} from "@/lib/asr-config";
 import { buildFilmstrip, cachedFilmstrip, filmstripKey } from "@/lib/clip-filmstrip";
+import { shouldAutoTranscribe } from "@/lib/asr-policy";
 import { loadStoredMedia, requestPersistentStorage, storeMediaFile } from "@/lib/media-store";
 import { parseSliceMap, type SliceMapReport } from "@/lib/slice-map";
-import { syncSliceCues } from "@/lib/slice-sync";
+import { ensureMinimumPoints } from "@/lib/slice-geometry";
+import { alignScriptToTranscript } from "@/lib/script-align";
+import { syncSliceBeats, syncSliceCues, narrationBeats } from "@/lib/slice-sync";
 import { transcribeAudio, type TranscriptionResult } from "@/lib/transcribe-audio";
 import { SliceEditorDialog, SliceSurface } from "@/components/slice-editor";
+import { PromptBuilderDialog } from "@/components/prompt-builder";
 import { PreviewBoard } from "@/whiteboard/PreviewBoard";
 import { WhiteboardStage } from "@/whiteboard/WhiteboardStage";
 import {
   ANCHOR_WINDOW_SECONDS,
   MIN_SLICE_ANIMATION,
   MIN_SLICE_HOLD,
+  SLICE_END_HOLD,
   resolveSliceTiming,
   timingBands,
+  transcriptHasPhrase,
   type SliceTimingFlag,
 } from "@/lib/slice-timing";
 import {
@@ -175,7 +190,15 @@ type Clip = {
 };
 type Transition = { id: string; leftId: string; rightId: string; effect: string; duration: number };
 /** Settings shared by every scene; a clip can opt out with its own override. */
-type ProjectSettings = { whiteboard: WhiteboardConfig };
+type ProjectSettings = {
+  whiteboard: WhiteboardConfig;
+  /**
+   * The words the narrator was supposed to read. Cues are matched against this
+   * first, then projected onto the transcript, so ASR spelling never has to be
+   * exact. Empty means "match cues directly against the words that were heard".
+   */
+  narrationScript?: string | undefined;
+};
 type Project = {
   tracks: Track[];
   clips: Clip[];
@@ -356,6 +379,7 @@ const SLICE_FLAG_TEXT: Record<SliceTimingFlag, string> = {
   tight: "reveal does not fit before the next slice",
   override: "start moved by hand",
   early: "starts before the narration describes it",
+  estimated: "placed by rule, not by its words",
 };
 
 /**
@@ -374,14 +398,24 @@ function bandedSlices(clip: Clip): SliceShape[] {
 }
 
 /**
- * Finds the narration covering an image clip, plus the offset that maps
- * transcript time onto the clip's own timeline. Words before the image or after
- * it stay in the list — the cue resolver is the one that decides they are out
- * of range.
+ * Finds the voice narration covering an image clip, plus the offset that maps
+ * transcript time onto the clip's own timeline.
+ *
+ * Only clips on Voice rows qualify: music is never transcribed and never drives
+ * a reveal. Words before the image or after it stay in the list — the cue
+ * resolver is the one that decides they are out of range.
  */
-function narrationForClip(clip: Clip, clips: Clip[]) {
+function narrationForClip(clip: Clip, clips: Clip[], tracks: Track[]) {
+  const voiceTracks = new Set(
+    tracks.filter((track) => track.category === "voice").map((track) => track.id),
+  );
   const best = clips
-    .filter((candidate) => candidate.mediaType === "audio" && candidate.transcript)
+    .filter(
+      (candidate) =>
+        candidate.mediaType === "audio" &&
+        candidate.transcript &&
+        voiceTracks.has(candidate.trackId),
+    )
     .map((candidate) => ({
       candidate,
       overlap:
@@ -395,8 +429,15 @@ function narrationForClip(clip: Clip, clips: Clip[]) {
   const transcript = audio?.transcript;
   if (!audio || !transcript) return null;
   return {
+    clipId: audio.id,
     transcript,
     offsetSeconds: clip.start - audio.start + audio.sourceOffset,
+    /**
+     * Where the voice stops, in this image's own seconds. The scene is sized to
+     * the narration, so this is the natural end of the cut — a picture that can
+     * be drawn in 9 s still stays up for a 24 s voice.
+     */
+    endSeconds: audio.start + audio.duration - clip.start,
   };
 }
 
@@ -487,7 +528,11 @@ function ClipSlices({
         // A hand-moved start is already visible as the purple lag, so the
         // warning badge is reserved for problems the user cannot see: a
         // collision, a missing hold, or a reveal running ahead of the words.
-        const problems = flags.filter((flag) => flag !== "override");
+        // An estimate is not a problem, but it is not a measurement either, so
+        // it gets its own badge rather than hiding among the timed slices.
+        const problems = flags.filter((flag) => flag !== "override" && flag !== "estimated");
+        const estimatedHere = flags.includes("estimated");
+        const needsBadge = problems.length > 0 || estimatedHere;
         // A reveal may be shortened until it only just fits, but it must still
         // leave the minimum hold — below that, speeding up cannot fix it.
         const speedTarget = Math.max(MIN_SLICE_ANIMATION, nextStart - start - MIN_SLICE_HOLD);
@@ -539,39 +584,53 @@ function ClipSlices({
                 />
               </>
             )}
-            {problems.length > 0 && (
+            {needsBadge && (
               <DropdownMenu>
                 <DropdownMenuTrigger asChild>
                   <button
                     type="button"
-                    className="slice-flag"
+                    className={`slice-flag${problems.length ? "" : " estimated"}`}
                     style={{ left: percent(start) }}
-                    title={`Slice ${slice.number}: ${problems
+                    title={`Slice ${slice.number}: ${flags
+                      .filter((flag) => flag !== "override")
                       .map((flag) => SLICE_FLAG_TEXT[flag])
                       .join("; ")}`}
-                    aria-label={`Slice ${slice.number} timing needs attention`}
+                    aria-label={
+                      problems.length
+                        ? `Slice ${slice.number} timing needs attention`
+                        : `Slice ${slice.number} was placed by estimation`
+                    }
                     onPointerDown={(event) => event.stopPropagation()}
                     onClick={(event) => event.stopPropagation()}
                   >
-                    !
+                    {problems.length ? "!" : "≈"}
                   </button>
                 </DropdownMenuTrigger>
                 <DropdownMenuContent align="start" side="top" className="slice-flag-menu">
-                  <DropdownMenuLabel>Reveal timing</DropdownMenuLabel>
-                  <DropdownMenuItem
-                    disabled={!canSpeedUp}
-                    title={
-                      canSpeedUp
-                        ? "Draw this reveal faster so it fits before the next slice"
-                        : "This reveal is already as short as the speed limit allows"
-                    }
-                    onSelect={() => onFlagAction(clip, slice, "speed-up", speedTarget)}
-                  >
-                    Speed the reveal up to {speedTarget.toFixed(2)}s
-                  </DropdownMenuItem>
-                  <DropdownMenuItem onSelect={() => onFlagAction(clip, slice, "widen-cue")}>
-                    Widen the cue search
-                  </DropdownMenuItem>
+                  <DropdownMenuLabel>{problems.length ? "Reveal timing" : "Placed by rule"}</DropdownMenuLabel>
+                  {estimatedHere && (
+                    <DropdownMenuItem disabled>
+                      Its words were not found, so it was fitted between its neighbours
+                    </DropdownMenuItem>
+                  )}
+                  {problems.length > 0 && (
+                    <>
+                      <DropdownMenuItem
+                        disabled={!canSpeedUp}
+                        title={
+                          canSpeedUp
+                            ? "Draw this reveal faster so it fits before the next slice"
+                            : "This reveal is already as short as the speed limit allows"
+                        }
+                        onSelect={() => onFlagAction(clip, slice, "speed-up", speedTarget)}
+                      >
+                        Speed the reveal up to {speedTarget.toFixed(2)}s
+                      </DropdownMenuItem>
+                      <DropdownMenuItem onSelect={() => onFlagAction(clip, slice, "widen-cue")}>
+                        Widen the cue search
+                      </DropdownMenuItem>
+                    </>
+                  )}
                   <DropdownMenuItem onSelect={() => onFlagAction(clip, slice, "drop")}>
                     Drop this slice
                   </DropdownMenuItem>
@@ -670,6 +729,9 @@ function Editor() {
   const filePickerRef = useRef<HTMLInputElement>(null);
   const audioPickerRef = useRef<HTMLInputElement>(null);
   const selectedClip = project.clips.find((clip) => clip.id === selectedId) ?? null;
+  const selectedTrack = selectedClip
+    ? (project.tracks.find((track) => track.id === selectedClip.trackId) ?? null)
+    : null;
   // CUTS stays on the last image cut even while the playhead is being scrubbed,
   // otherwise deselecting (a lane tap) would hide the slicer mid-preview.
   const [lastImageId, setLastImageId] = useState<string | null>(null);
@@ -711,21 +773,81 @@ function Editor() {
     ? [...(selectedClip.slices ?? [])].sort((a, b) => a.order - b.order)
     : [];
   const cutsSlices = cutsClip?.slices ?? [];
+  // Play position of the open image, so an exported map says which image it is.
+  const cutsImageNumber = cutsClip
+    ? [...project.clips]
+        .filter((clip) => clip.mediaType === "image")
+        .sort((a, b) => a.start - b.start)
+        .findIndex((clip) => clip.id === cutsClip.id) + 1
+    : 1;
+  // The slicer's manual trigger field is powered by the voice under this scene.
+  const cutsNarration = cutsClip
+    ? narrationForClip(cutsClip, project.clips, project.tracks)
+    : null;
   const [sliceEditorOpen, setSliceEditorOpen] = useState(false);
+  const [promptBuilderOpen, setPromptBuilderOpen] = useState(false);
   const [sliceSettingsOpen, setSliceSettingsOpen] = useState(false);
   const [selectedSliceId, setSelectedSliceId] = useState<string | null>(null);
   const [asr, setAsr] = useState<AsrConfig>(() => loadAsrConfig());
-  const [asrJob, setAsrJob] = useState<{ clipId: string; done: number; total: number } | null>(
-    null,
-  );
+  const [asrJob, setAsrJob] = useState<{
+    clipId: string;
+    name: string;
+    done: number;
+    total: number;
+    /** True when the drop started it, so the status chip can report it. */
+    background?: boolean;
+  } | null>(null);
   const [asrError, setAsrError] = useState<string | null>(null);
+  // A background failure has no inspector to land in, so it gets a chip.
+  const [asrNotice, setAsrNotice] = useState<{
+    clipId: string;
+    name: string;
+    message: string;
+  } | null>(null);
+  // Voice clips that land on a Voice row are transcribed without being asked.
+  // Jobs run one at a time — Whisper is slow, and the progress chip is singular
+  // — so each drop joins a queue instead of starting a parallel request.
+  const asrQueue = useRef<Promise<void>>(Promise.resolve());
+  const queuedTranscriptions = useRef(new Set<string>());
+  const runTranscription = useRef<
+    (clip: Clip, options?: { background?: boolean }) => Promise<void>
+  >(async () => {});
+  /**
+   * Queues a freshly landed audio clip for transcription, if its row is a Voice
+   * row. Music never qualifies, and a clip that already has words is skipped.
+   */
+  const queueAutoTranscription = useCallback((clip: Clip) => {
+    if (queuedTranscriptions.current.has(clip.id)) return;
+    const track = projectRef.current.tracks.find((item) => item.id === clip.trackId);
+    if (!shouldAutoTranscribe(clip, track)) return;
+    queuedTranscriptions.current.add(clip.id);
+    asrQueue.current = asrQueue.current
+      .then(async () => {
+        // The project may have changed while this clip waited its turn.
+        const fresh = projectRef.current.clips.find((item) => item.id === clip.id);
+        if (!fresh) return;
+        const currentTrack = projectRef.current.tracks.find((item) => item.id === fresh.trackId);
+        if (!shouldAutoTranscribe(fresh, currentTrack)) return;
+        await runTranscription.current(fresh, { background: true });
+      })
+      .catch(() => {
+        // transcribeNarration reports its own failure; keep the queue moving.
+      });
+  }, []);
   const [cueDrafts, setCueDrafts] = useState<Record<string, string>>({});
   const [cueStatus, setCueStatus] = useState<string | null>(null);
+  const [scriptDraft, setScriptDraft] = useState(() => project.settings.narrationScript ?? "");
 
   // A sync report belongs to the clip it was run on, not the next one selected.
   useEffect(() => {
     setCueStatus(null);
   }, [selectedId]);
+
+  // Undo and a fresh project can change the script without the textarea being
+  // touched, so the draft follows the stored value.
+  useEffect(() => {
+    setScriptDraft(project.settings.narrationScript ?? "");
+  }, [project.settings.narrationScript]);
 
   const commitProject = useCallback(
     (next: Project | ((current: Project) => Project), options?: { silent?: boolean }) => {
@@ -739,6 +861,10 @@ function Editor() {
       }
       projectRef.current = updated;
       setProject(updated);
+      // A sync report describes one exact schedule. As soon as the project
+      // changes — an undo, a trim, a hand-moved boundary — the counts stop
+      // matching the timeline, so the report must go with it.
+      if (!options?.silent) setCueStatus(null);
     },
     [],
   );
@@ -749,6 +875,8 @@ function Editor() {
     redoStack.current.push(projectRef.current);
     projectRef.current = previous;
     setProject(previous);
+    // The sync report counted a schedule that no longer exists.
+    setCueStatus(null);
   }, []);
 
   const redo = useCallback(() => {
@@ -757,6 +885,7 @@ function Editor() {
     undoStack.current.push(projectRef.current);
     projectRef.current = next;
     setProject(next);
+    setCueStatus(null);
   }, []);
 
   // When the engine reports how long the drawing naturally takes (on first load
@@ -837,6 +966,23 @@ function Editor() {
       },
     }));
   };
+
+  /**
+   * Stores the script once, on blur, so typing does not fill the undo stack.
+   * An empty script means "no script": cue matching falls back to the words
+   * that were actually heard.
+   */
+  const commitNarrationScript = useCallback(
+    (text: string) => {
+      const next = text.trim() ? text : "";
+      if ((projectRef.current.settings.narrationScript ?? "") === next) return;
+      commitProject((current) => ({
+        ...current,
+        settings: { ...current.settings, narrationScript: next || undefined },
+      }));
+    },
+    [commitProject],
+  );
 
   /** Drops every per-scene override so the global settings take over again. */
   const applyGlobalToAllScenes = () => {
@@ -973,6 +1119,9 @@ function Editor() {
       };
       commitProject((current) => ({ ...current, clips: [...current.clips, clip] }));
       setSelectedId(clip.id);
+      // Landing on a Voice row is the whole gesture: transcribe it right away
+      // so its words are ready before the user reaches the slicer.
+      queueAutoTranscription(clip);
       // The library length was measured when the file was imported. If the
       // global animation settings changed since then, re-fit this scene so it
       // lands with the timing every other scene is using.
@@ -985,7 +1134,7 @@ function Editor() {
         }
       }
     },
-    [applyNaturalDuration, commitProject],
+    [applyNaturalDuration, commitProject, queueAutoTranscription],
   );
 
   const ingestFiles = useCallback(
@@ -1273,8 +1422,11 @@ function Editor() {
         ],
       }));
       setSelectedId(copies[0]?.id ?? null);
+      // Shipped narration is transcribed as soon as it reaches the voice row;
+      // a music row is left alone forever.
+      if (target === "voice") copies.forEach(queueAutoTranscription);
     },
-    [commitProject],
+    [commitProject, queueAutoTranscription],
   );
 
   const removeTrack = useCallback(
@@ -1784,6 +1936,12 @@ function Editor() {
             item.id === drag.clipId ? { ...item, start: nextStart, trackId: nextTrackId } : item,
           ),
         }));
+        // Dragging audio onto a Voice row is another way to land narration
+        // there, so it gets the same automatic transcription as a drop.
+        if (nextTrackId !== drag.trackId) {
+          const moved = projectRef.current.clips.find((item) => item.id === drag.clipId);
+          if (moved) queueAutoTranscription(moved);
+        }
       }
       setDrag(null);
     };
@@ -1793,7 +1951,7 @@ function Editor() {
       window.removeEventListener("pointermove", onMove);
       window.removeEventListener("pointerup", onUp);
     };
-  }, [commitProject, drag, rowNeighbours, snapStart, zoom]);
+  }, [commitProject, drag, queueAutoTranscription, rowNeighbours, snapStart, zoom]);
 
   useEffect(() => {
     if (!trimDrag) return;
@@ -1996,9 +2154,27 @@ function Editor() {
     if (!cutsClip) return;
     const existing = cutsClip.slices ?? [];
     const nextNumber = existing.length + 1;
-    const slice: SliceShape = { id: makeId(), number: nextNumber, order: nextNumber, points };
+    // Drawn borders get the same minimum as imported ones, so every slice in
+    // the editor can be reshaped the same way.
+    const slice: SliceShape = {
+      id: makeId(),
+      number: nextNumber,
+      order: nextNumber,
+      points: ensureMinimumPoints(points).points,
+    };
     applyClipSlices(cutsClip, [...existing, slice]);
     setSelectedSliceId(slice.id);
+  };
+
+  /** Writes a border the user reshaped in the slicer. One drag, one undo step. */
+  const changeSlicePoints = (sliceId: string, points: SlicePoint[]) => {
+    if (!cutsClip) return;
+    applyClipSlices(
+      cutsClip,
+      (cutsClip.slices ?? []).map((slice) =>
+        slice.id === sliceId ? { ...slice, points } : slice,
+      ),
+    );
   };
 
   const reorderSlice = (id: string, order: number) => {
@@ -2027,12 +2203,12 @@ function Editor() {
    * a bad paste can never leave the image half-sliced.
    */
   const importSliceMap = (text: string): SliceMapReport => {
-    const report = parseSliceMap(text);
+    const report = parseSliceMap(text, { fileName: cutsClip?.name });
     if (report.errors.length > 0 || !cutsClip) return report;
 
     const shapes: SliceShape[] = report.slices.map((slice, index) => ({
       id: makeId(),
-      number: index + 1,
+      number: slice.number ?? index + 1,
       order: slice.order,
       points: slice.points.map((point) => ({ x: point.x, y: point.y })),
       ...(slice.cue ? { cue: slice.cue } : {}),
@@ -2087,18 +2263,36 @@ function Editor() {
    * overwrites the words in place.
    */
   const transcribeNarration = useCallback(
-    async (clip: Clip) => {
+    async (clip: Clip, options?: { background?: boolean }) => {
+      const background = options?.background === true;
       setAsrError(null);
-      setAsrJob({ clipId: clip.id, done: 0, total: 0 });
+      const track = projectRef.current.tracks.find((item) => item.id === clip.trackId);
+      if (track?.category !== "voice") {
+        setAsrError("Whisper only transcribes voice rows. Move this audio to a Voice row first.");
+        return;
+      }
+      setAsrJob({
+        clipId: clip.id,
+        name: clip.name,
+        done: 0,
+        total: 0,
+        ...(background ? { background: true } : {}),
+      });
       try {
         const response = await fetch(clip.src);
         if (!response.ok) throw new Error(`Could not read "${clip.name}".`);
         const blob = await response.blob();
         const transcript = await transcribeAudio(blob, {
-          endpoint: asr.endpoint,
-          token: asr.token || undefined,
+          endpoint: DEFAULT_ASR_ENDPOINT,
           language: asr.language || undefined,
-          onProgress: (done, total) => setAsrJob({ clipId: clip.id, done, total }),
+          onProgress: (done, total) =>
+            setAsrJob({
+              clipId: clip.id,
+              name: clip.name,
+              done,
+              total,
+              ...(background ? { background: true } : {}),
+            }),
         });
         commitProject(
           (current) => ({
@@ -2112,8 +2306,13 @@ function Editor() {
         if (!transcript.words.length) {
           setAsrError("No speech was found in this clip.");
         }
+        setAsrNotice((current) => (current?.clipId === clip.id ? null : current));
       } catch (error) {
-        setAsrError(error instanceof Error ? error.message : "Transcription failed.");
+        const message = error instanceof Error ? error.message : "Transcription failed.";
+        setAsrError(message);
+        // A background job has no open inspector to show the reason, so leave a
+        // chip on the timeline naming the voice that failed.
+        if (background) setAsrNotice({ clipId: clip.id, name: clip.name, message });
       } finally {
         setAsrJob(null);
       }
@@ -2121,10 +2320,17 @@ function Editor() {
     [asr, commitProject],
   );
 
+  // The queue is built before this callback exists, so it reaches it by ref.
+  useEffect(() => {
+    runTranscription.current = transcribeNarration;
+  }, [transcribeNarration]);
+
   /**
    * Saves one slice's cue phrase. Drafts live in component state so typing does
    * not push a history entry per keystroke; this runs on blur or Enter and only
    * records a commit when the phrase actually changed.
+   *
+   * Returns true when a cue changed, so the caller can re-run alignment.
    */
   const commitSliceCue = useCallback(
     (clipId: string, sliceId: string, cue: string) => {
@@ -2135,24 +2341,31 @@ function Editor() {
         delete next[sliceId];
         return next;
       });
-      commitProject((current) => {
-        const clip = current.clips.find((item) => item.id === clipId);
-        const slice = clip?.slices?.find((item) => item.id === sliceId);
-        if (!clip || !slice || (slice.cue ?? "") === trimmed) return current;
-        return {
-          ...current,
-          clips: current.clips.map((item) =>
-            item.id === clipId
-              ? {
-                  ...item,
-                  slices: (item.slices ?? []).map((entry) =>
-                    entry.id === sliceId ? { ...entry, cue: trimmed || undefined } : entry,
-                  ),
-                }
-              : item,
-          ),
-        };
-      });
+      const clip = projectRef.current.clips.find((item) => item.id === clipId);
+      const slice = clip?.slices?.find((item) => item.id === sliceId);
+      if (!clip || !slice || (slice.cue ?? "") === trimmed) return false;
+      commitProject((current) => ({
+        ...current,
+        clips: current.clips.map((item) =>
+          item.id === clipId
+            ? {
+                ...item,
+                slices: (item.slices ?? []).map((entry) =>
+                  entry.id === sliceId
+                    ? {
+                        ...entry,
+                        cue: trimmed || undefined,
+                        ...(entry.timing?.estimated === true
+                          ? { timing: { ...entry.timing, estimated: false } }
+                          : {}),
+                      }
+                    : entry,
+                ),
+              }
+            : item,
+        ),
+      }));
+      return true;
     },
     [commitProject],
   );
@@ -2164,19 +2377,66 @@ function Editor() {
    */
   const syncCuesToNarration = useCallback(
     (clip: Clip) => {
-      const narration = narrationForClip(clip, projectRef.current.clips);
+      const narration = narrationForClip(clip, projectRef.current.clips, projectRef.current.tracks);
       if (!narration) {
         setCueStatus("Add narration audio under this image, then transcribe it.");
         return;
       }
 
       const ordered = [...(clip.slices ?? [])].sort((a, b) => a.order - b.order);
-      const result = syncSliceCues(ordered, narration.transcript.words, {
+      // A scene is as long as the narration that belongs to it. The picture's
+      // natural draw time is only a floor: cues spoken at 12 s must not be
+      // squeezed into a 9 s cut. Growth stops at whatever comes next — the next
+      // clip on this row, or the end of the voice itself.
+      const nextStart = projectRef.current.clips
+        .filter(
+          (item) =>
+            item.trackId === clip.trackId && item.id !== clip.id && item.start > clip.start + 0.001,
+        )
+        .reduce((earliest, item) => Math.min(earliest, item.start), Number.POSITIVE_INFINITY);
+      const ceiling = Math.min(narration.endSeconds, nextStart - clip.start);
+      const maxDuration = Math.max(clip.duration, ceiling);
+      const options = {
         offsetSeconds: narration.offsetSeconds,
         clipDuration: clip.duration,
-      });
+        maxDuration,
+        candidates: narrationBeats(narration.transcript.words),
+      };
 
-      if (result.patches.length) {
+      // With a script, alignment happens once for the whole scene: the script
+      // text is the source of truth for wording, and the transcript only says
+      // when those words were heard. Without one, fall back to matching each
+      // cue directly against the transcript.
+      const script = (projectRef.current.settings.narrationScript ?? "").trim();
+      const cueBeats = ordered
+        .filter((slice) => (slice.cue ?? "").trim())
+        .map((slice) => ({ id: slice.id, cue: (slice.cue ?? "").trim() }));
+      const alignment = script
+        ? alignScriptToTranscript(script, cueBeats, narration.transcript.words)
+        : null;
+      const result = alignment
+        ? syncSliceBeats(
+            ordered,
+            alignment.beats.map((beat) => ({
+              id: beat.id,
+              cue: beat.cue,
+              anchor: beat.anchor,
+            })),
+            options,
+          )
+        : syncSliceCues(ordered, narration.transcript.words, options);
+
+      // Grow to the voice, or a little past the final reveal if that drawing
+      // runs longer than the words. Never shrink: a scene the user lengthened
+      // by hand stays that way.
+      const needed = Math.max(ceiling, result.spanEnd + SLICE_END_HOLD);
+      const duration = Math.max(
+        clip.duration,
+        Math.round(Math.min(maxDuration, needed) * 100) / 100,
+      );
+      const grows = duration > clip.duration + 0.01;
+
+      if (result.patches.length || grows) {
         const patches = new Map(result.patches.map((entry) => [entry.id, entry.timing]));
         commitProject((current) => ({
           ...current,
@@ -2184,6 +2444,7 @@ function Editor() {
             item.id === clip.id
               ? {
                   ...item,
+                  ...(grows ? { duration } : {}),
                   slices: (item.slices ?? []).map((slice) => {
                     const timing = patches.get(slice.id);
                     return timing ? { ...slice, timing: { ...slice.timing, ...timing } } : slice;
@@ -2195,14 +2456,119 @@ function Editor() {
       }
 
       const parts: string[] = [];
-      if (result.patches.length) parts.push(`${result.patches.length} timed`);
-      if (result.missing.length) parts.push(`${result.missing.length} not in the narration`);
+      const timed = result.patches.length - result.estimated.length;
+      if (timed) parts.push(`${timed} timed`);
+      if (result.estimated.length) {
+        // Explain *why* these were fitted, but never count them twice: they are
+        // already in `estimated`, not in the miss tally.
+        const fitted = new Set(result.estimated);
+        const reasons = alignment
+          ? alignment.misses.filter((miss) => fitted.has(miss.id)).map((miss) => miss.reason)
+          : [];
+        const reason =
+          reasons.length === 1
+            ? reasons[0] === "not-in-script"
+              ? "not in the script"
+              : "not spoken"
+            : null;
+        parts.push(`${result.estimated.length} estimated${reason ? ` (${reason})` : ""}`);
+      }
+      if (alignment?.weak.length) parts.push(`${alignment.weak.length} uncertain`);
+      if (result.missing.length) {
+        parts.push(
+          alignment
+            ? `${result.missing.length} could not be placed`
+            : `${result.missing.length} not in the narration`,
+        );
+      }
       if (result.noCue.length) parts.push(`${result.noCue.length} without a cue`);
       if (result.clamped.length) parts.push(`${result.clamped.length} pushed later`);
       setCueStatus(parts.length ? parts.join(" · ") : "This image has no slices yet.");
     },
     [commitProject],
   );
+
+  /**
+   * Re-aligns one image from its newest slices.
+   *
+   * Alignment is part of writing a cue, not a second action: the schedule the
+   * editor needs is derived as soon as the words change. An image whose slices
+   * have no cues at all is left alone so its default timing is not overwritten.
+   */
+  const alignCuesForClip = useCallback(
+    (clipId: string) => {
+      const clip = projectRef.current.clips.find((item) => item.id === clipId);
+      if (!clip || clip.mediaType !== "image") return;
+      if (!(clip.slices ?? []).some((slice) => (slice.cue ?? "").trim())) return;
+      syncCuesToNarration(clip);
+    },
+    [syncCuesToNarration],
+  );
+
+  /**
+   * Manual trigger phrases from the slicer.
+   *
+   * This is the authoring path that starts from the voice instead of the
+   * script: the user picks a slice and types words Whisper actually heard. It
+   * stays unavailable until the scene has a transcribed voice, and it refuses
+   * phrases the transcript does not contain, so a cue can never point at
+   * silence. A saved phrase aligns the scene immediately.
+   */
+  const setSlicerCue = useCallback(
+    (sliceId: string, cue: string) => {
+      if (!cutsClip) return "No scene is open in the slicer.";
+      const state = projectRef.current;
+      const narration = narrationForClip(cutsClip, state.clips, state.tracks);
+      if (!narration) {
+        return "Upload the voice for this scene and transcribe it first.";
+      }
+      const trimmed = cue.replace(/\s+/g, " ").trim();
+      if (trimmed && !transcriptHasPhrase(narration.transcript.words, trimmed)) {
+        return "Those words are not in the voice transcript. Copy a phrase from the transcript below.";
+      }
+      if (commitSliceCue(cutsClip.id, sliceId, trimmed)) alignCuesForClip(cutsClip.id);
+      return null;
+    },
+    [alignCuesForClip, commitSliceCue, cutsClip],
+  );
+
+  /**
+   * One click from the slicer to the preview: resolve every cue against the
+   * voice, close the slicer, and play the scene from its first frame so the
+   * reveals can be watched instead of read as a report.
+   */
+  const autoAlignAndPreview = useCallback(() => {
+    if (!cutsClip) return;
+    alignCuesForClip(cutsClip.id);
+    const clip = projectRef.current.clips.find((item) => item.id === cutsClip.id) ?? cutsClip;
+    setSliceEditorOpen(false);
+    setSelectedSliceId(null);
+    playheadRef.current = clip.start;
+    setPlayhead(clip.start);
+    setIsPlaying(true);
+  }, [alignCuesForClip, cutsClip]);
+
+  // A transcript that just landed can place cues that were written before the
+  // voice existed, so alignment follows Whisper instead of waiting for a click.
+  const alignedTranscripts = useRef(new Map<string, unknown>());
+  useEffect(() => {
+    const state = projectRef.current;
+    const fresh = state.clips.filter((clip) => {
+      if (clip.mediaType !== "audio" || !clip.transcript) return false;
+      if (alignedTranscripts.current.get(clip.id) === clip.transcript) return false;
+      alignedTranscripts.current.set(clip.id, clip.transcript);
+      return true;
+    });
+    if (!fresh.length) return;
+    fresh.forEach((voice) => {
+      state.clips.forEach((image) => {
+        if (image.mediaType !== "image") return;
+        if (!(image.slices ?? []).some((slice) => (slice.cue ?? "").trim())) return;
+        if (narrationForClip(image, state.clips, state.tracks)?.clipId !== voice.id) return;
+        syncCuesToNarration(image);
+      });
+    });
+  }, [project.clips, syncCuesToNarration]);
 
   /** Turns a finished boundary drag into authored timing on the clip. */
   const applySliceDrag = useCallback(
@@ -2224,8 +2590,9 @@ function Editor() {
         );
         if (Math.abs(start - timing.start) < 0.005) return;
         // Taking the boundary off its cue is exactly what `startOverride`
-        // records, so the resolver stops re-anchoring this slice.
-        patchSliceTiming(clip.id, gesture.sliceId, { startOverride: round(start) });
+        // records, so the resolver stops re-anchoring this slice. A hand-placed
+        // slice is no longer an estimate.
+        patchSliceTiming(clip.id, gesture.sliceId, { startOverride: round(start), estimated: false });
         return;
       }
 
@@ -2236,7 +2603,7 @@ function Editor() {
         Math.max(MIN_SLICE_ANIMATION, nextStart - timing.start),
       );
       if (Math.abs(animation - timing.animation) < 0.005) return;
-      patchSliceTiming(clip.id, gesture.sliceId, { animation: round(animation) });
+      patchSliceTiming(clip.id, gesture.sliceId, { animation: round(animation), estimated: false });
     },
     [patchSliceTiming],
   );
@@ -2915,6 +3282,10 @@ function Editor() {
                 onChange={updateGlobalWhiteboard}
                 asr={asr}
                 onAsrChange={updateAsr}
+                script={scriptDraft}
+                onScriptChange={setScriptDraft}
+                onScriptCommit={() => commitNarrationScript(scriptDraft)}
+                onOpenPromptBuilder={() => setPromptBuilderOpen(true)}
               />
               <div className="settings-foot">
                 <span className="settings-count">
@@ -3394,7 +3765,7 @@ function Editor() {
                   {project.tracks.find((track) => track.id === selectedClip.trackId)?.name}
                 </span>
               </div>
-              {selectedClip.mediaType === "audio" && (
+              {selectedClip.mediaType === "audio" && selectedTrack?.category === "voice" && (
                 <div className="whiteboard-controls">
                   <div className="whiteboard-controls-head">
                     <span>Narration</span>
@@ -3450,6 +3821,18 @@ function Editor() {
                     )}
                   </div>
                   {asrError && <p className="narration-error">{asrError}</p>}
+                </div>
+              )}
+              {selectedClip.mediaType === "audio" && selectedTrack?.category === "music" && (
+                <div className="whiteboard-controls">
+                  <div className="whiteboard-controls-head">
+                    <span>Music</span>
+                    <span className="narration-count">Never transcribed</span>
+                  </div>
+                  <p className="whiteboard-hint">
+                    Whisper only listens to Voice rows. Trigger phrases come from the spoken
+                    narration, never from music.
+                  </p>
                 </div>
               )}
               {selectedClip.mediaType === "image" && (
@@ -3554,6 +3937,20 @@ function Editor() {
                     Type the words that should start a reveal. Sync finds them in the
                     narration under this image.
                   </p>
+                  <label className="cue-script">
+                    <span>
+                      Script <small>paste only the spoken lines</small>
+                    </span>
+                    <textarea
+                      className="cue-script-input"
+                      value={scriptDraft}
+                      spellCheck={false}
+                      rows={4}
+                      placeholder="With the script here, Sync aligns it to the narration once, so a cue still lands when speech-to-text spells a word differently."
+                      onChange={(event) => setScriptDraft(event.target.value)}
+                      onBlur={() => commitNarrationScript(scriptDraft)}
+                    />
+                  </label>
                   <div className="cue-list">
                     {selectedSlices.map((slice) => {
                       const visible = cueDrafts[slice.id] ?? slice.cue ?? "";
@@ -3572,7 +3969,10 @@ function Editor() {
                                 [slice.id]: event.target.value,
                               }))
                             }
-                            onBlur={() => commitSliceCue(selectedClip.id, slice.id, visible)}
+                            onBlur={() => {
+                              if (commitSliceCue(selectedClip.id, slice.id, visible))
+                                alignCuesForClip(selectedClip.id);
+                            }}
                             onKeyDown={(event) => {
                               if (event.key === "Enter") event.currentTarget.blur();
                             }}
@@ -3718,6 +4118,32 @@ function Editor() {
             </Button>
           </div>
           <div className="zoom-actions">
+            {asrJob?.background ? (
+              <span
+                className="asr-chip"
+                title={`Whisper is transcribing ${asrJob.name}. Music rows are never transcribed.`}
+              >
+                <RefreshCw size={11} className="spin" />
+                {asrJob.total ? `Voice ${asrJob.done}/${asrJob.total}` : "Reading voice…"}
+              </span>
+            ) : null}
+            {!asrJob && asrNotice ? (
+              <span
+                className="asr-chip is-error"
+                title={`${asrNotice.name}: ${asrNotice.message}`}
+              >
+                <TriangleAlert size={11} />
+                Voice not transcribed
+                <button
+                  type="button"
+                  className="asr-chip-close"
+                  aria-label="Dismiss transcription error"
+                  onClick={() => setAsrNotice(null)}
+                >
+                  ×
+                </button>
+              </span>
+            ) : null}
             {isRecording || recordingError ? (
               <span
                 className={`recording-chip${recordingError ? " record-error" : ""}`}
@@ -4058,18 +4484,31 @@ function Editor() {
           />
         ))}
 
+      {promptBuilderOpen && (
+        <PromptBuilderDialog
+          script={scriptDraft}
+          onScriptCommit={commitNarrationScript}
+          onClose={() => setPromptBuilderOpen(false)}
+        />
+      )}
       {sliceEditorOpen && cutsClip && (
         <SliceEditorDialog
           name={cutsClip.name}
+          imageNumber={cutsImageNumber}
+          sceneSeconds={cutsClip.duration}
           src={cutsClip.src}
           slices={cutsSlices}
           selectedId={selectedSliceId}
           onSelect={setSelectedSliceId}
           onCreate={addSlice}
+          onChangePoints={changeSlicePoints}
           onImportMap={importSliceMap}
           onReorder={reorderSlice}
           onDelete={deleteSlice}
           onClear={clearSlices}
+          narrationText={cutsNarration?.transcript.text ?? null}
+          onSetCue={setSlicerCue}
+          onAutoAlign={autoAlignAndPreview}
           onClose={() => setSliceEditorOpen(false)}
         />
       )}
@@ -4349,11 +4788,19 @@ function GlobalSettings({
   onChange,
   asr,
   onAsrChange,
+  script,
+  onScriptChange,
+  onScriptCommit,
+  onOpenPromptBuilder,
 }: {
   config: WhiteboardConfig;
   onChange: (patch: Partial<WhiteboardConfig>) => void;
   asr: AsrConfig;
   onAsrChange: (patch: Partial<AsrConfig>) => void;
+  script: string;
+  onScriptChange: (text: string) => void;
+  onScriptCommit: () => void;
+  onOpenPromptBuilder: () => void;
 }) {
   return (
     <div className="settings-fields global-settings-fields">
@@ -4456,45 +4903,49 @@ function GlobalSettings({
       <div className="settings-divider" />
       <span className="settings-eyebrow">NARRATION</span>
       <p className="settings-note">
-        Audio is transcribed by your own Cloudflare Worker. This token stays in this
-        browser and is never written into the project.
+        Audio is transcribed by Cutline&rsquo;s Cloudflare Worker. Pick the spoken language so
+        Whisper listens for the right sounds.
       </p>
-      <label className="field-label" htmlFor="asr-endpoint">
-        Worker URL
+      <label className="field-label" htmlFor="script-input">
+        Narration script
       </label>
-      <input
-        id="asr-endpoint"
-        className="editor-input"
-        type="url"
+      <textarea
+        id="script-input"
+        className="cue-script-input settings-script"
+        value={script}
         spellCheck={false}
-        value={asr.endpoint}
-        placeholder="https://cutline-asr.example.workers.dev"
-        onChange={(event) => onAsrChange({ endpoint: event.target.value })}
+        rows={5}
+        placeholder="Paste only the spoken lines. Sync aligns this text to the transcript once, then places every cue against the script."
+        onChange={(event) => onScriptChange(event.target.value)}
+        onBlur={onScriptCommit}
       />
-      <label className="field-label" htmlFor="asr-token">
-        Access token <span>optional</span>
+      <p className="settings-note">
+        This is the source of truth for cue words: Polish fixes the wording, the image prompt builds
+        cues from it, and Sync matches every cue against these exact words.
+      </p>
+      <button type="button" className="prompt-open" onClick={onOpenPromptBuilder}>
+        <Sparkles size={12} />
+        Polish script &amp; build image prompt
+      </button>
+      <label className="field-label label-with-icon" htmlFor="asr-language">
+        <span>
+          <Flag size={11} />
+          Language
+        </span>
+        <span>{ASR_LANGUAGES.find((entry) => entry.value === asr.language)?.flag ?? "🌐"}</span>
       </label>
-      <input
-        id="asr-token"
-        className="editor-input"
-        type="password"
-        autoComplete="off"
-        value={asr.token}
-        placeholder="Only if the worker has a SHARED_SECRET"
-        onChange={(event) => onAsrChange({ token: event.target.value })}
-      />
-      <label className="field-label" htmlFor="asr-language">
-        Language
-      </label>
-      <input
+      <select
         id="asr-language"
-        className="editor-input"
-        type="text"
-        spellCheck={false}
+        className="editor-select"
         value={asr.language}
-        placeholder="en"
         onChange={(event) => onAsrChange({ language: event.target.value })}
-      />
+      >
+        {ASR_LANGUAGES.map((language) => (
+          <option key={language.value} value={language.value}>
+            {language.flag} {language.label}
+          </option>
+        ))}
+      </select>
     </div>
   );
 }

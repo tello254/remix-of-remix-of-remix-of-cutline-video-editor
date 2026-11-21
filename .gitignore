@@ -19,6 +19,11 @@ dist-ssr
 # Temporary fixtures used while iterating on the whiteboard preview
 public/.seed/
 
+# Local secrets (VITE_GEMINI_API_KEY and friends)
+.env
+.env.*
+!.env.example
+
 # Wrangler / Cloudflare
 .wrangler/
 .dev.vars

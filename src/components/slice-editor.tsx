@@ -2,18 +2,29 @@ import { useLayoutEffect, useRef, useState, type PointerEvent as ReactPointerEve
 import { createPortal } from "react-dom";
 import {
   ChevronDown,
+  ChevronLeft,
+  ChevronRight,
   ChevronUp,
   ClipboardPaste,
   Check,
   Expand,
   MousePointer2,
   PenLine,
+  Sparkles,
   Square,
   Trash2,
   X,
 } from "lucide-react";
 import type { SlicePoint, SliceShape } from "@/whiteboard/types";
+import {
+  clampPoint,
+  movePoint,
+  polygonArea,
+  samePoints,
+  translatePoints,
+} from "@/lib/slice-geometry";
 import { serializeSliceMap, type SliceMapReport } from "@/lib/slice-map";
+import { resolveSliceTiming } from "@/lib/slice-timing";
 
 type SliceMode = "select" | "rect" | "pen";
 
@@ -25,21 +36,27 @@ type SliceSurfaceProps = {
   interactive?: boolean;
   onSelect?: (id: string | null) => void;
   onCreate?: (points: SlicePoint[]) => void;
+  /** Called once when a border drag ends, never on every pixel of the drag. */
+  onChangePoints?: (id: string, points: SlicePoint[]) => void;
   className?: string;
 };
 
-function polygonArea(points: SlicePoint[]) {
-  let area = 0;
-  for (let i = 0; i < points.length; i++) {
-    const a = points[i]!;
-    const b = points[(i + 1) % points.length]!;
-    area += a.x * b.y - b.x * a.y;
-  }
-  return Math.abs(area) / 2;
-}
-
-function clampPoint(x: number, y: number): SlicePoint {
-  return { x: Math.min(1, Math.max(0, x)), y: Math.min(1, Math.max(0, y)) };
+/** Distance from a point to a line segment, in the surface's pixels. */
+function distanceToSegment(point: SlicePoint, a: SlicePoint, b: SlicePoint, w: number, h: number) {
+  const ax = a.x * w;
+  const ay = a.y * h;
+  const bx = b.x * w;
+  const by = b.y * h;
+  const px = point.x * w;
+  const py = point.y * h;
+  const dx = bx - ax;
+  const dy = by - ay;
+  const lengthSquared = dx * dx + dy * dy;
+  const t =
+    lengthSquared > 0
+      ? Math.min(1, Math.max(0, ((px - ax) * dx + (py - ay) * dy) / lengthSquared))
+      : 0;
+  return Math.hypot(px - (ax + t * dx), py - (ay + t * dy));
 }
 
 function rectPoints(a: SlicePoint, b: SlicePoint): SlicePoint[] {
@@ -68,6 +85,7 @@ export function SliceSurface({
   interactive = true,
   onSelect,
   onCreate,
+  onChangePoints,
   className,
 }: SliceSurfaceProps) {
   const wrapRef = useRef<HTMLDivElement | null>(null);
@@ -76,6 +94,21 @@ export function SliceSurface({
   const [rectStart, setRectStart] = useState<SlicePoint | null>(null);
   const [rectCurrent, setRectCurrent] = useState<SlicePoint | null>(null);
   const [draft, setDraft] = useState<SlicePoint[] | null>(null);
+  const [preview, setPreview] = useState<{ id: string; points: SlicePoint[] } | null>(null);
+  const [blockedVertex, setBlockedVertex] = useState<{ id: string; index: number } | null>(null);
+  const shaping = mode === "select" && interactive;
+
+  // The drag is kept in a ref: pointer moves arrive faster than React renders,
+  // and every position is computed from where the drag *started*, so a fast
+  // drag cannot drift away from the cursor.
+  const shapeDrag = useRef<{
+    kind: "body" | "vertex";
+    id: string;
+    index?: number;
+    origin: SlicePoint;
+    points: SlicePoint[];
+    current: SlicePoint[];
+  } | null>(null);
 
   useLayoutEffect(() => {
     const element = wrapRef.current;
@@ -98,14 +131,14 @@ export function SliceSurface({
     h: natural.h * scale,
   };
 
-  const pointOf = (event: ReactPointerEvent<Element>) => {
+  const pointOf = (event: { clientX: number; clientY: number }) => {
     const element = wrapRef.current;
     if (!element) return { x: 0, y: 0 };
     const bounds = element.getBoundingClientRect();
-    return clampPoint(
-      (event.clientX - bounds.left - content.x) / Math.max(1, content.w),
-      (event.clientY - bounds.top - content.y) / Math.max(1, content.h),
-    );
+    return clampPoint({
+      x: (event.clientX - bounds.left - content.x) / Math.max(1, content.w),
+      y: (event.clientY - bounds.top - content.y) / Math.max(1, content.h),
+    });
   };
 
   const capture = (event: ReactPointerEvent<Element>) => {
@@ -114,6 +147,96 @@ export function SliceSurface({
     } catch {
       // Synthetic pointer events (tests) have no capture target.
     }
+  };
+
+  /**
+   * Starts moving a border: a corner when `index` is given, the whole outline
+   * otherwise. Selecting happens immediately, so the handles appear even for a
+   * click that never moves.
+   */
+  const beginShapeDrag = (
+    event: ReactPointerEvent<Element>,
+    slice: SliceShape,
+    index?: number,
+  ) => {
+    if (!interactive) return;
+    event.stopPropagation();
+    onSelect?.(slice.id);
+    if (mode !== "select") return;
+    event.preventDefault();
+    capture(event);
+    const points = slice.points.map((point) => ({ x: point.x, y: point.y }));
+    shapeDrag.current = {
+      kind: index === undefined ? "body" : "vertex",
+      id: slice.id,
+      ...(index === undefined ? {} : { index }),
+      origin: pointOf(event),
+      points,
+      current: points,
+    };
+    setBlockedVertex(null);
+    setPreview({ id: slice.id, points });
+  };
+
+  const moveShapeDrag = (event: ReactPointerEvent<Element>) => {
+    const drag = shapeDrag.current;
+    if (!drag) return;
+    const point = pointOf(event);
+    if (drag.kind === "vertex" && drag.index !== undefined) {
+      const outcome = movePoint(drag.points, drag.index, point);
+      if (!outcome.moved) {
+        // The border would fold or vanish: keep the last good position and say
+        // so by colouring the handle, rather than snapping the shape away.
+        setBlockedVertex({ id: drag.id, index: drag.index });
+        return;
+      }
+      setBlockedVertex(null);
+      drag.current = outcome.points;
+      setPreview({ id: drag.id, points: outcome.points });
+      return;
+    }
+    const moved = translatePoints(drag.points, point.x - drag.origin.x, point.y - drag.origin.y);
+    drag.current = moved;
+    setPreview({ id: drag.id, points: moved });
+  };
+
+  /** Returns true when a border drag was in progress, so drawing is skipped. */
+  const endShapeDrag = () => {
+    const drag = shapeDrag.current;
+    if (!drag) return false;
+    shapeDrag.current = null;
+    setBlockedVertex(null);
+    setPreview(null);
+    if (!samePoints(drag.points, drag.current)) onChangePoints?.(drag.id, drag.current);
+    return true;
+  };
+
+  /**
+   * Double-clicking an edge inserts a corner at its midpoint. Five points is the
+   * floor, not a limit: a drawing with arms and legs needs more handles to hug.
+   */
+  const addVertex = (
+    event: { clientX: number; clientY: number; stopPropagation: () => void },
+    slice: SliceShape,
+  ) => {
+    if (!interactive || mode !== "select" || !onChangePoints) return;
+    event.stopPropagation();
+    const point = pointOf(event);
+    let edge = 0;
+    let nearest = Number.POSITIVE_INFINITY;
+    slice.points.forEach((a, index) => {
+      const b = slice.points[(index + 1) % slice.points.length]!;
+      const distance = distanceToSegment(point, a, b, content.w || 1, content.h || 1);
+      if (distance < nearest) {
+        nearest = distance;
+        edge = index;
+      }
+    });
+    const a = slice.points[edge]!;
+    const b = slice.points[(edge + 1) % slice.points.length]!;
+    const next = slice.points.map((entry) => ({ x: entry.x, y: entry.y }));
+    next.splice(edge + 1, 0, { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 });
+    onChangePoints(slice.id, next);
   };
 
   const beginDraw = (event: ReactPointerEvent<SVGSVGElement>) => {
@@ -193,31 +316,61 @@ export function SliceSurface({
         }}
       />
       <svg
-        className="slice-overlay"
+        className={`slice-overlay ${shaping ? "is-shaping" : ""}`}
         width={size.w}
         height={size.h}
         viewBox={`0 0 ${size.w || 1} ${size.h || 1}`}
         onPointerDown={beginDraw}
-        onPointerMove={moveDraw}
-        onPointerUp={finishDraw}
-        onPointerCancel={finishDraw}
+        onPointerMove={(event) => {
+          if (shapeDrag.current) {
+            moveShapeDrag(event);
+            return;
+          }
+          moveDraw(event);
+        }}
+        onPointerUp={() => {
+          if (endShapeDrag()) return;
+          finishDraw();
+        }}
+        onPointerCancel={() => {
+          if (endShapeDrag()) return;
+          finishDraw();
+        }}
       >
         {slices.map((slice) => {
           const selected = selectedId === slice.id;
-          const label = centerOf(slice.points);
+          const shown = preview?.id === slice.id ? preview.points : slice.points;
+          const label = centerOf(shown);
           return (
             <g key={slice.id} className={`slice-shape ${selected ? "selected" : ""}`}>
               <polygon
-                points={px(slice.points)}
-                onPointerDown={(event) => {
-                  if (!interactive) return;
-                  event.stopPropagation();
-                  onSelect?.(slice.id);
-                }}
+                points={px(shown)}
+                onPointerDown={(event) => beginShapeDrag(event, slice)}
+                onDoubleClick={(event) => addVertex(event, slice)}
               />
               <text x={label.x} y={label.y} textAnchor="middle" dominantBaseline="central">
                 {slice.number}
               </text>
+              {selected && shaping && (
+                <g className="slice-vertices">
+                  {shown.map((point, index) => (
+                    <circle
+                      key={`${slice.id}-${index}`}
+                      className={`slice-vertex${
+                        blockedVertex?.id === slice.id && blockedVertex.index === index
+                          ? " blocked"
+                          : ""
+                      }`}
+                      cx={content.x + point.x * content.w}
+                      cy={content.y + point.y * content.h}
+                      r={6}
+                      onPointerDown={(event) => beginShapeDrag(event, slice, index)}
+                    >
+                      <title>Drag this point to reshape the border</title>
+                    </circle>
+                  ))}
+                </g>
+              )}
             </g>
           );
         })}
@@ -238,30 +391,172 @@ export function SliceSurface({
 
 type SliceEditorDialogProps = {
   name: string;
+  /** 1-based play position of this image, written into an exported map. */
+  imageNumber: number;
+  /** The cut's own length, so reveal times can be resolved as they will play. */
+  sceneSeconds: number;
   src: string;
   slices: SliceShape[];
   selectedId: string | null;
   onSelect: (id: string | null) => void;
   onCreate: (points: SlicePoint[]) => void;
+  onChangePoints: (id: string, points: SlicePoint[]) => void;
   onImportMap: (text: string) => SliceMapReport;
   onReorder: (id: string, order: number) => void;
   onDelete: (id: string) => void;
   onClear: () => void;
+  /** The voice transcript under this scene, or null until one exists. */
+  narrationText: string | null;
+  /** Returns a human error, or null when the cue was accepted. */
+  onSetCue: (sliceId: string, cue: string) => string | null;
+  /** Resolves the cues, closes the slicer and plays the scene from its start. */
+  onAutoAlign: () => void;
   onClose: () => void;
 };
+
+/**
+ * A small timestamp for the slicer: seconds under a minute, `m:ss.s` above.
+ */
+function revealStamp(seconds: number) {
+  const safe = Math.max(0, seconds);
+  const minutes = Math.floor(safe / 60);
+  const rest = safe - minutes * 60;
+  return minutes ? `${minutes}:${rest.toFixed(1).padStart(4, "0")}` : `${rest.toFixed(1)}s`;
+}
+
+/**
+ * The voice-first way to author a cue: pick a slice, type words that were
+ * actually spoken. It is locked until the scene has a transcript, and the
+ * owner validates the phrase so a cue cannot point at silence.
+ */
+function SliceCueField({
+  slice,
+  narrationText,
+  revealSeconds,
+  estimated,
+  onSetCue,
+  canStep,
+  onStepSlice,
+}: {
+  slice: SliceShape;
+  narrationText: string | null;
+  /** The resolved start of this reveal, not just when its words are spoken. */
+  revealSeconds?: number | undefined;
+  estimated?: boolean | undefined;
+  onSetCue: (sliceId: string, cue: string) => string | null;
+  canStep: boolean;
+  onStepSlice: (delta: 1 | -1) => void;
+}) {
+  const [draft, setDraft] = useState(slice.cue ?? "");
+  const [error, setError] = useState<string | null>(null);
+  const [saved, setSaved] = useState(false);
+
+  const commit = () => {
+    const message = onSetCue(slice.id, draft);
+    setError(message);
+    setSaved(!message && draft.trim() !== (slice.cue ?? "").trim());
+  };
+
+  const stepButtons = canStep ? (
+    <div className="slice-cue-nav">
+      <button
+        type="button"
+        className="slice-cue-step"
+        aria-label="Previous slice"
+        title="Previous slice"
+        onClick={() => onStepSlice(-1)}
+      >
+        <ChevronLeft size={12} />
+      </button>
+      <button
+        type="button"
+        className="slice-cue-step"
+        aria-label="Next slice"
+        title="Next slice"
+        onClick={() => onStepSlice(1)}
+      >
+        <ChevronRight size={12} />
+      </button>
+    </div>
+  ) : null;
+
+  if (narrationText === null) {
+    return (
+      <div className="slice-cue-panel is-locked">
+        <div className="slice-cue-head">
+          <span className="slice-cue-title">Trigger phrase</span>
+          {stepButtons}
+        </div>
+        <p className="slice-cue-locked">
+          Upload the voice for this scene and transcribe it first. Trigger phrases must be words
+          Whisper actually heard.
+        </p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="slice-cue-panel">
+      <div className="slice-cue-head">
+        <label className="slice-cue-title" htmlFor="slice-trigger">
+          Trigger phrase
+        </label>
+        {stepButtons}
+      </div>
+      <input
+        id="slice-trigger"
+        className="slice-cue-input"
+        type="text"
+        value={draft}
+        spellCheck={false}
+        placeholder="Type words from the voice transcript"
+        onChange={(event) => {
+          setDraft(event.target.value);
+          setError(null);
+          setSaved(false);
+        }}
+        onBlur={commit}
+        onKeyDown={(event) => {
+          if (event.key === "Enter") event.currentTarget.blur();
+        }}
+      />
+      <p className="slice-cue-hint">
+        Must appear in the voice transcript. Sync waits for these words.
+      </p>
+      {revealSeconds !== undefined ? (
+        <p className="slice-cue-timing">
+          Reveals at {revealStamp(revealSeconds)}
+          {estimated ? " · estimated between its neighbours" : ""}
+        </p>
+      ) : null}
+      {error ? <p className="slice-cue-error">{error}</p> : null}
+      {saved ? <p className="slice-cue-saved">Saved.</p> : null}
+      <details className="slice-cue-transcript">
+        <summary>Voice transcript</summary>
+        <p>{narrationText}</p>
+      </details>
+    </div>
+  );
+}
 
 /** Full-size slicing studio, opened from the CUTS card. */
 export function SliceEditorDialog({
   name,
+  imageNumber,
+  sceneSeconds,
   src,
   slices,
   selectedId,
   onSelect,
   onCreate,
+  onChangePoints,
   onImportMap,
   onReorder,
   onDelete,
   onClear,
+  narrationText,
+  onSetCue,
+  onAutoAlign,
   onClose,
 }: SliceEditorDialogProps) {
   const [mode, setMode] = useState<SliceMode>("rect");
@@ -273,13 +568,39 @@ export function SliceEditorDialog({
   // or shuffles the list — only its Position changes.
   const total = slices.length;
   const labelled = [...slices].sort((a, b) => a.number - b.number);
+  const selectedSlice = slices.find((slice) => slice.id === selectedId) ?? null;
+  // The slicer reports the reveal the viewer will actually see, not the cue's
+  // word time: when a reveal is pushed past its neighbour those differ.
+  const revealById = new Map(
+    resolveSliceTiming(
+      [...slices].sort((a, b) => a.order - b.order),
+      sceneSeconds,
+    ).slices.map((timing) => [timing.id, timing]),
+  );
+  // A slice nobody cued is still given a default slot; showing that as a reveal
+  // time would claim knowledge the narration never provided.
+  const revealOf = (slice: SliceShape) =>
+    (slice.cue ?? "").trim() || slice.timing?.intendedStart !== undefined
+      ? revealById.get(slice.id)?.start
+      : undefined;
+  const cued = slices.filter((slice) => (slice.cue ?? "").trim()).length;
+  const alignBlocked =
+    narrationText === null
+      ? "Upload the voice for this scene and transcribe it first."
+      : cued === 0
+        ? "Give at least one slice a trigger phrase."
+        : null;
 
   const applyMap = () => {
-    setMapReport(onImportMap(mapText));
+    const report = onImportMap(mapText);
+    setMapReport(report);
+    // An imported border is only a starting point: the picture says whether it
+    // actually surrounds the drawing, so hand the user the handles at once.
+    if (report.errors.length === 0) setMode("select");
   };
 
   const copyMap = () => {
-    const text = serializeSliceMap(slices);
+    const text = serializeSliceMap(slices, { image: imageNumber, file: name });
     const done = () => {
       setCopied(true);
       window.setTimeout(() => setCopied(false), 1600);
@@ -328,6 +649,7 @@ export function SliceEditorDialog({
               mode={mode}
               onSelect={onSelect}
               onCreate={onCreate}
+              onChangePoints={onChangePoints}
             />
             <div className="slice-tools">
               <button
@@ -354,7 +676,8 @@ export function SliceEditorDialog({
               <span className="slice-tools-hint">
                 {mode === "rect" && "Drag a box around the part you want next."}
                 {mode === "pen" && "Draw a loop; the border closes itself."}
-                {mode === "select" && "Click a slice to set its position."}
+                {mode === "select" &&
+                  "Drag a point to reshape, drag inside to move, double-click an edge to add a point."}
               </span>
             </div>
           </div>
@@ -378,7 +701,15 @@ export function SliceEditorDialog({
                     onClick={() => onSelect(slice.id)}
                   >
                     <span className="slice-row-badge">{slice.number}</span>
-                    <span className="slice-row-name">Slice {slice.number}</span>
+                    <span className="slice-row-name">
+                      Slice {slice.number}
+                      <small className="slice-row-points">
+                        {slice.points.length} points
+                        {revealOf(slice) !== undefined
+                          ? ` · ${revealStamp(revealOf(slice) ?? 0)}`
+                          : ""}
+                      </small>
+                    </span>
                     <div className="slice-row-order" onClick={(event) => event.stopPropagation()}>
                       <span>Position</span>
                       <button
@@ -429,6 +760,42 @@ export function SliceEditorDialog({
                 ))}
               </ol>
             )}
+            {total > 0 &&
+              (selectedSlice ? (
+                <SliceCueField
+                  key={selectedSlice.id}
+                  slice={selectedSlice}
+                  narrationText={narrationText}
+                  revealSeconds={revealOf(selectedSlice)}
+                  estimated={selectedSlice.timing?.estimated === true}
+                  onSetCue={onSetCue}
+                  canStep={total > 1}
+                  onStepSlice={(delta) => {
+                    const index = labelled.findIndex((item) => item.id === selectedSlice.id);
+                    if (index < 0) return;
+                    const next = labelled[(index + delta + labelled.length) % labelled.length];
+                    if (next) onSelect(next.id);
+                  }}
+                />
+              ) : (
+                <p className="slice-cue-empty">Select a slice to give it a trigger phrase.</p>
+              ))}
+            <div className="slice-align-panel">
+              <button
+                type="button"
+                className="slice-align-button"
+                disabled={alignBlocked !== null}
+                title={alignBlocked ?? "Resolve the cues and play the scene from its start"}
+                onClick={onAutoAlign}
+              >
+                <Sparkles size={12} />
+                Auto-align & preview
+              </button>
+              <p className="slice-align-hint">
+                {alignBlocked ??
+                  `Every cue is placed in the voice, then the scene plays so you can watch the reveals land.`}
+              </p>
+            </div>
             <div className="slice-map-panel">
               <button
                 type="button"

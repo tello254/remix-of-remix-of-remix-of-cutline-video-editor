@@ -25,6 +25,12 @@ import { SLICER_FPS, SLICER_PAINT_TICKS, SLICER_TRAVEL_TICKS, slicerBands } from
 export const MIN_SLICE_ANIMATION = 0.25;
 /** A completed reveal needs at least this long on screen to register. */
 export const MIN_SLICE_HOLD = 0.3;
+/**
+ * Breathing room after the final reveal when the voice stops mid-slice. The
+ * scene normally runs to the end of its narration; this only applies when a
+ * drawing finishes later than the last word.
+ */
+export const SLICE_END_HOLD = 0.5;
 
 const EPSILON = 1e-6;
 
@@ -57,6 +63,12 @@ export type SliceTimingInput = {
   anchorWindow?: number | null;
   /** Allows the widened search to cross a clause break. */
   crossClause?: boolean | null;
+  /**
+   * Set when the slice's words could not be found and its position was fitted
+   * between its neighbours instead. Estimation is never silent: the resolver
+   * raises a flag so the editor can badge it.
+   */
+  estimated?: boolean | null;
 };
 
 export type SliceTimingFlag =
@@ -67,7 +79,9 @@ export type SliceTimingFlag =
   /** The user moved the start by hand. */
   | "override"
   /** The slice now begins before the words that describe it. */
-  | "early";
+  | "early"
+  /** Its words were not found, so its place was fitted between its neighbours. */
+  | "estimated";
 
 export type ResolvedSliceTiming = {
   id: string;
@@ -138,10 +152,18 @@ export function resolveSliceTiming(
   const defaults = defaultSliceTimings(orderedSlices.length, scene);
   const authored = orderedSlices.map((slice, index) => {
     const timing = slice.timing ?? {};
+    // Once a slice has been placed by the narration it no longer shares the
+    // scene evenly with its neighbours. Its reveal keeps the engine's natural
+    // paint time and the hold absorbs the rest, so growing the scene to fit a
+    // long voice never turns a one-second drawing into a slow one.
+    const placed = timing.intendedStart !== undefined || (timing.anchorStart ?? null) !== null;
     return {
       id: slice.id,
       intended: timing.intendedStart ?? defaults[index]?.intendedStart ?? 0,
-      animation: Math.max(EPSILON, timing.animation ?? defaults[index]?.animation ?? 1),
+      animation: Math.max(
+        EPSILON,
+        timing.animation ?? (placed ? naturalSliceAnimation() : defaults[index]?.animation) ?? 1,
+      ),
       minHold: timing.minHold ?? defaultMinHold,
       override: timing.startOverride ?? null,
       anchorStart: timing.anchorStart ?? null,
@@ -169,6 +191,7 @@ export function resolveSliceTiming(
     if (start > want + EPSILON) flags.push("clamped");
     if (slice.override !== null) flags.push("override");
     if (start < slice.intended - EPSILON) flags.push("early");
+    if (orderedSlices[index]?.timing?.estimated === true) flags.push("estimated");
 
     start = Math.max(0, Math.min(start, Math.max(0, scene - minAnimation)));
 
@@ -299,6 +322,22 @@ function findOccurrences(tokens: string[], phrase: string[]) {
 function countNgram(tokens: string[], at: number, length: number) {
   const phrase = tokens.slice(at, at + length);
   return findOccurrences(tokens, phrase).length;
+}
+
+/**
+ * True when the phrase appears as consecutive words in the transcript.
+ *
+ * Used by the slicer's manual trigger field: a cue typed there must be words
+ * Whisper actually heard, not words from the written script that were never
+ * spoken. Punctuation and case are ignored, word order is not.
+ */
+export function transcriptHasPhrase(words: TranscriptWord[], phrase: string) {
+  const target = phrase
+    .split(WORD_SPLIT)
+    .map(normaliseToken)
+    .filter((token) => token.length > 0);
+  if (!target.length) return false;
+  return findOccurrences(transcriptTokens(words), target).length > 0;
 }
 
 /**

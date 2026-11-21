@@ -285,6 +285,8 @@
 .inspector-content { display: flex; flex-direction: column; gap: 12px; padding: 3px 16px 18px; }
 .field-label { display: flex; justify-content: space-between; margin-top: 5px; color: var(--muted-foreground); font-size: 10px; }
 .field-label span { color: var(--foreground); }
+.label-with-icon > span:first-child { display: inline-flex; align-items: center; gap: 5px; color: var(--muted-foreground); }
+.label-with-icon > span:last-child { font-size: 12px; line-height: 1; }
 .editor-select { height: 34px; padding: 0 9px; color: var(--foreground); background: var(--editor-lane); border: 1px solid var(--editor-separator); border-radius: 4px; font: inherit; font-size: 11px; }
 .editor-input { height: 30px; padding: 0 9px; color: var(--foreground); background: var(--editor-lane); border: 1px solid var(--editor-separator); border-radius: 4px; font: inherit; font-size: 10px; }
 .editor-input:focus { outline: none; border-color: color-mix(in oklab, var(--primary) 60%, transparent); }
@@ -322,6 +324,13 @@
 .cue-input { min-width: 0; flex: 1; height: 26px; padding: 0 7px; color: var(--foreground); background: var(--editor-surface); border: 1px solid var(--editor-separator); border-radius: 4px; font: inherit; font-size: 10px; }
 .cue-input::placeholder { color: var(--muted-foreground); }
 .cue-input:focus { outline: none; border-color: color-mix(in oklab, var(--primary) 60%, transparent); }
+.cue-script { display: flex; flex-direction: column; gap: 4px; }
+.cue-script > span { display: flex; align-items: baseline; gap: 5px; color: var(--foreground); font-size: 9.5px; font-weight: 600; }
+.cue-script small { color: var(--muted-foreground); font-weight: 400; font-size: 8.5px; }
+.cue-script-input { width: 100%; min-height: 54px; resize: vertical; padding: 6px 7px; color: var(--foreground); background: var(--editor-surface); border: 1px solid var(--editor-separator); border-radius: 4px; font: inherit; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 9.5px; line-height: 1.5; }
+.cue-script-input::placeholder { color: var(--muted-foreground); font-family: inherit; }
+.cue-script-input:focus { outline: none; border-color: color-mix(in oklab, var(--primary) 60%, transparent); }
+.settings-script { min-height: 72px; }
 .cue-status { margin: 0; color: var(--muted-foreground); font-size: 9px; line-height: 1.5; }
 .inspector-empty { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 15px; text-align: center; color: var(--muted-foreground); }
 .inspector-empty-symbol { color: var(--editor-soft); font-size: 21px; }
@@ -388,6 +397,8 @@
 .slice-handle:hover::after, .slice-handle:active::after { background: #fef08a; }
 .slice-flag { position: absolute; top: 1px; z-index: 5; display: grid; place-items: center; width: 12px; height: 12px; margin-left: 2px; padding: 0; color: #1c1917; background: #facc15; border: 0; border-radius: 50%; font-size: 9px; font-weight: 700; line-height: 1; cursor: pointer; pointer-events: auto; }
 .slice-flag:hover { background: #fde047; }
+.slice-flag.estimated { color: #082f49; background: #7dd3fc; }
+.slice-flag.estimated:hover { background: #bae6fd; }
 .slice-flag-menu { min-width: 13rem; font-size: .78rem; }
 .clip-block > .clip-thumb, .clip-block > .clip-label, .clip-block > .clip-duration, .clip-block > .clip-audio-shipped { position: relative; z-index: 1; text-shadow: 0 1px 2px rgb(0 0 0 / 85%); }
 .clip-block.image::after, .clip-block.video::after { position: absolute; inset: 0; z-index: 0; background: linear-gradient(90deg, rgb(4 8 10 / 78%), rgb(4 8 10 / 22%) 58%, rgb(4 8 10 / 45%)); content: ""; pointer-events: none; }
@@ -414,6 +425,10 @@
 .record-error { min-width: 0; max-width: 200px; overflow: hidden; color: var(--editor-record); text-overflow: ellipsis; white-space: nowrap; }
 .record-error svg { flex: 0 0 auto; }
 .recording-dot { width: 6px; height: 6px; background: var(--editor-record); border-radius: 50%; animation: record-pulse 1s ease-in-out infinite alternate; }
+.asr-chip { display: inline-flex; align-items: center; gap: 5px; height: 24px; margin-right: 4px; padding: 0 6px; color: var(--editor-soft); background: var(--editor-surface); border-radius: 4px; font-size: 9px; font-weight: 600; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.asr-chip.is-error { color: var(--editor-record); background: color-mix(in oklab, var(--editor-record) 12%, transparent); }
+.asr-chip-close { display: inline-flex; align-items: center; justify-content: center; width: 14px; height: 14px; padding: 0; color: inherit; background: transparent; border: 0; border-radius: 3px; font: inherit; font-size: 12px; line-height: 1; cursor: pointer; }
+.asr-chip-close:hover { background: color-mix(in oklab, var(--editor-record) 18%, transparent); }
 .record-stop-square { width: 9px; height: 9px; background: var(--editor-record); border-radius: 2px; }
 .hidden-audio { display: none; }
 /* Top bar import actions and the mobile media drawer */
@@ -558,6 +573,12 @@
 .slice-shape.selected polygon { fill: color-mix(in oklab, var(--primary) 26%, transparent); stroke: var(--primary); stroke-width: 2px; stroke-dasharray: none; }
 .slice-shape text { fill: #fff; font-size: 11px; font-weight: 700; pointer-events: none; paint-order: stroke; stroke: rgb(0 0 0 / 62%); stroke-width: 2.5px; user-select: none; }
 .slice-draft { fill: color-mix(in oklab, var(--primary) 18%, transparent); stroke: var(--primary); stroke-width: 1.5px; stroke-dasharray: 5 4; pointer-events: none; }
+.slice-overlay.is-shaping .slice-shape.selected polygon { cursor: move; }
+.slice-vertex { fill: #f8fafc; stroke: #0b1015; stroke-width: 1.5px; cursor: grab; }
+.slice-vertex:hover { fill: #fde047; }
+.slice-vertex:active { cursor: grabbing; }
+.slice-vertex.blocked { fill: #f87171; stroke: #450a0a; }
+.slice-row-points { display: block; margin-top: 1px; color: var(--editor-soft); font-size: 8px; line-height: 1.2; }
 
 .slice-dialog-backdrop { position: fixed; inset: 0; z-index: 80; display: grid; place-items: center; padding: 3vh 3vw; background: rgb(4 8 10 / 74%); backdrop-filter: blur(2px); }
 .slice-dialog { display: flex; flex-direction: column; width: min(1100px, 95vw); height: min(740px, 94vh); overflow: hidden; color: var(--foreground); background: var(--editor-surface, #12161b); border: 1px solid var(--editor-separator); border-radius: 10px; box-shadow: 0 32px 90px rgb(0 0 0 / 60%); }
@@ -591,6 +612,29 @@
 .slice-row-step:disabled { opacity: .35; cursor: default; }
 .slice-row-delete { width: 20px; height: 20px; display: grid; place-items: center; padding: 0; color: var(--editor-soft); background: none; border: 0; border-radius: 3px; cursor: pointer; }
 .slice-row-delete:hover { color: var(--editor-record); background: color-mix(in oklab, var(--editor-record) 14%, transparent); }
+.slice-cue-panel { display: flex; flex-direction: column; gap: 5px; padding: 8px; background: var(--editor-lane); border: 1px solid var(--editor-separator); border-radius: 6px; }
+.slice-cue-panel.is-locked { border-style: dashed; }
+.slice-cue-title { color: var(--foreground); font-size: 9.5px; font-weight: 600; }
+.slice-cue-head { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
+.slice-cue-nav { display: inline-flex; align-items: center; gap: 2px; }
+.slice-cue-step { display: inline-flex; align-items: center; justify-content: center; width: 18px; height: 18px; padding: 0; color: var(--editor-soft); background: var(--editor-surface); border: 1px solid var(--editor-separator); border-radius: 3px; cursor: pointer; }
+.slice-cue-step:hover { color: var(--foreground); border-color: color-mix(in oklab, var(--primary) 55%, transparent); }
+.slice-cue-input { height: 26px; padding: 0 8px; color: var(--foreground); background: var(--editor-surface); border: 1px solid var(--editor-separator); border-radius: 4px; font: inherit; font-size: 10px; }
+.slice-cue-input:focus { outline: none; border-color: color-mix(in oklab, var(--primary) 55%, transparent); }
+.slice-cue-hint, .slice-cue-empty { margin: 0; color: var(--editor-soft); font-size: 8.5px; line-height: 1.45; }
+.slice-cue-timing { margin: 0; color: var(--primary); font-size: 8.5px; line-height: 1.4; }
+.slice-cue-empty { padding: 4px 2px; }
+.slice-cue-locked { margin: 0; color: var(--editor-soft); font-size: 9px; line-height: 1.45; }
+.slice-cue-error { margin: 0; color: var(--editor-record); font-size: 9px; line-height: 1.4; }
+.slice-cue-saved { margin: 0; color: var(--primary); font-size: 8.5px; }
+.slice-cue-transcript { color: var(--editor-soft); font-size: 8.5px; }
+.slice-cue-transcript summary { cursor: pointer; }
+.slice-cue-transcript p { max-height: 90px; overflow-y: auto; margin: 4px 0 0; padding: 5px 6px; color: var(--muted-foreground); background: var(--editor-surface); border-radius: 4px; font-size: 9px; line-height: 1.4; }
+.slice-align-panel { display: flex; flex-direction: column; gap: 4px; }
+.slice-align-button { display: inline-flex; align-items: center; justify-content: center; gap: 5px; height: 27px; color: var(--primary-foreground); background: var(--primary); border: 0; border-radius: 4px; font: inherit; font-size: 10px; font-weight: 600; cursor: pointer; }
+.slice-align-button:hover:not(:disabled) { filter: brightness(1.08); }
+.slice-align-button:disabled { color: var(--editor-soft); background: var(--editor-surface); cursor: not-allowed; }
+.slice-align-hint { margin: 0; color: var(--editor-soft); font-size: 8.5px; line-height: 1.4; }
 .slice-side-foot { display: flex; flex-direction: column; gap: 6px; margin-top: auto; color: var(--editor-soft); font-size: 9px; line-height: 1.45; }
 .slice-clear { align-self: flex-start; padding: 0; color: var(--editor-soft); background: none; border: 0; font: inherit; font-size: 9px; text-decoration: underline; cursor: pointer; }
 .slice-clear:hover { color: var(--foreground); }
@@ -615,6 +659,32 @@
 .slice-map-warnings li { color: #f0b657; }
 .slice-map-errors code { color: inherit; opacity: .75; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 8.5px; }
 .slice-map-hint { margin: 0; color: var(--editor-soft); font-size: 8.5px; line-height: 1.45; }
+
+.prompt-open { display: inline-flex; align-items: center; gap: 6px; height: 26px; margin-top: 2px; padding: 0 10px; color: var(--primary); background: color-mix(in oklab, var(--primary) 12%, transparent); border: 1px solid color-mix(in oklab, var(--primary) 45%, transparent); border-radius: 5px; font: inherit; font-size: 9.5px; font-weight: 600; cursor: pointer; }
+.prompt-open:hover { background: color-mix(in oklab, var(--primary) 20%, transparent); }
+
+.prompt-dialog { width: min(1180px, 95vw); height: min(780px, 94vh); }
+.prompt-body { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.05fr); }
+.prompt-column { display: flex; flex-direction: column; gap: 7px; min-height: 0; padding: 15px 18px; overflow-y: auto; }
+.prompt-column + .prompt-column { border-left: 1px solid var(--editor-separator); }
+.prompt-script, .prompt-output { padding: 8px 9px; color: var(--foreground); background: var(--editor-lane); border: 1px solid var(--editor-separator); border-radius: 5px; font-family: inherit; font-size: 10.5px; line-height: 1.55; resize: vertical; }
+.prompt-script:focus, .prompt-output:focus { outline: none; border-color: color-mix(in oklab, var(--primary) 55%, transparent); }
+.prompt-script { min-height: 230px; flex: 1 1 auto; }
+.prompt-output { flex: 1 1 auto; min-height: 220px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 9.5px; line-height: 1.5; }
+.prompt-meta { color: var(--editor-soft); font-size: 9px; }
+.prompt-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.prompt-actions button { height: 28px; display: inline-flex; align-items: center; justify-content: center; gap: 5px; padding: 0 11px; border-radius: 5px; font: inherit; font-size: 10px; cursor: pointer; transition: color .15s, background .15s, border-color .15s; }
+.prompt-actions button:disabled { opacity: .45; cursor: default; }
+.prompt-primary { color: #08111b; background: var(--primary); border: 1px solid var(--primary); font-weight: 600; }
+.prompt-primary:hover:not(:disabled) { background: color-mix(in oklab, var(--primary) 88%, white); }
+.prompt-secondary { color: var(--muted-foreground); background: var(--editor-lane); border: 1px solid var(--editor-separator); }
+.prompt-secondary:hover:not(:disabled) { color: var(--foreground); border-color: color-mix(in oklab, var(--primary) 50%, transparent); }
+.prompt-error { margin: 0; color: var(--editor-record); font-size: 9.5px; line-height: 1.4; }
+.prompt-pair { display: grid; grid-template-columns: minmax(0, 1fr) 110px; gap: 8px; }
+@media (max-width: 860px) {
+  .prompt-body { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr) minmax(0, 1fr); }
+  .prompt-column + .prompt-column { border-left: 0; border-top: 1px solid var(--editor-separator); }
+}
 
 @media (max-width: 760px) {
   .slice-dialog { width: 96vw; height: 92vh; }
