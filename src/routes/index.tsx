@@ -1115,6 +1115,7 @@ function Editor() {
         .sort((a, b) => a.start - b.start)
         .findIndex((clip) => clip.id === cutsClip.id) + 1
     : 1;
+  const imageCutCount = project.clips.filter((clip) => clip.mediaType === "image").length;
   // The slicer's manual trigger field is powered by the voice under this scene.
   const cutsNarration = cutsClip
     ? narrationForClip(cutsClip, project.clips, project.tracks)
@@ -2156,10 +2157,16 @@ function Editor() {
     const mutedTracks = new Set(
       project.tracks.filter((track) => track.muted).map((track) => track.id),
     );
+    // While playing, the animation loop owns the clock and the `playhead` state
+    // can lag behind it: a scene cut schedules a render through a transition, so
+    // the committed time is the moment of the cut, not now. Seeking audio to that
+    // stale time replays the last fraction of the previous clip at every join.
+    // Follow the live clock instead, even if this render arrived a beat late.
+    const time = isPlaying ? playheadRef.current : playhead;
     const activeVisuals = project.clips.filter(
-      (clip) => clip.kind === "visual" && isTimelineRangeActive(clip, playhead),
+      (clip) => clip.kind === "visual" && isTimelineRangeActive(clip, time),
     );
-    const hasAnyClip = project.clips.some((clip) => isTimelineRangeActive(clip, playhead));
+    const hasAnyClip = project.clips.some((clip) => isTimelineRangeActive(clip, time));
     project.clips
       .filter((clip) => clip.mediaType === "video")
       .forEach((clip) => {
@@ -2167,7 +2174,7 @@ function Editor() {
         if (!element) return;
         const active = isPlaying && activeVisuals.some((item) => item.id === clip.id);
         const localTime =
-          clip.sourceOffset + Math.min(clip.duration, Math.max(0, playhead - clip.start));
+          clip.sourceOffset + Math.min(clip.duration, Math.max(0, time - clip.start));
         if (Math.abs(element.currentTime - localTime) > 0.35) element.currentTime = localTime;
         element.muted = !active || mutedTracks.has(clip.trackId) || Boolean(clip.audioShipped);
         if (active && element.paused) void element.play().catch(() => undefined);
@@ -2178,9 +2185,9 @@ function Editor() {
       .forEach((clip) => {
         const element = audioRefs.current.get(clip.id);
         if (!element) return;
-        const active = isPlaying && isTimelineRangeActive(clip, playhead);
+        const active = isPlaying && isTimelineRangeActive(clip, time);
         const localTime =
-          clip.sourceOffset + Math.min(clip.duration, Math.max(0, playhead - clip.start));
+          clip.sourceOffset + Math.min(clip.duration, Math.max(0, time - clip.start));
         if (Math.abs(element.currentTime - localTime) > 0.35) element.currentTime = localTime;
         element.muted = !hasAnyClip || mutedTracks.has(clip.trackId);
         if (active && element.paused) void element.play().catch(() => undefined);
@@ -2913,6 +2920,30 @@ function Editor() {
       return null;
     },
     [alignCuesForClip, commitSliceCue, cutsClip],
+  );
+
+  /**
+   * Walking the row from inside the slicer.
+   *
+   * The dialog stays mounted while the image changes, so the map text, the map
+   * panel and the open transcript all survive the step. Only the borders, the
+   * cues and the selected slice change.
+   */
+  const stepSlicerImage = useCallback(
+    (delta: 1 | -1) => {
+      if (!cutsClip) return;
+      const images = projectRef.current.clips
+        .filter((clip) => clip.mediaType === "image")
+        .sort((a, b) => a.start - b.start);
+      const index = images.findIndex((clip) => clip.id === cutsClip.id);
+      const next = images[index + delta];
+      if (index < 0 || !next) return;
+      setSelectedId(next.id);
+      setCutsSource("timeline");
+      const first = [...(next.slices ?? [])].sort((a, b) => a.number - b.number)[0];
+      setSelectedSliceId(first?.id ?? null);
+    },
+    [cutsClip],
   );
 
   /**
@@ -4885,6 +4916,8 @@ function Editor() {
         <SliceEditorDialog
           name={cutsClip.name}
           imageNumber={cutsImageNumber}
+          imageTotal={imageCutCount}
+          onStepImage={stepSlicerImage}
           sceneSeconds={cutsClip.duration}
           src={cutsClip.src}
           slices={cutsSlices}

@@ -25,6 +25,7 @@ import {
   translatePoints,
 } from "@/lib/slice-geometry";
 import { serializeSliceMap, type SliceMapReport } from "@/lib/slice-map";
+import { cuePhraseSegments } from "@/lib/cue-highlight";
 import { resolveSliceTiming } from "@/lib/slice-timing";
 
 type SliceMode = "select" | "rect" | "pen";
@@ -394,6 +395,10 @@ type SliceEditorDialogProps = {
   name: string;
   /** 1-based play position of this image, written into an exported map. */
   imageNumber: number;
+  /** How many image cuts the project has, so the switcher can stop at the ends. */
+  imageTotal: number;
+  /** Moves the slicer to the previous or next image, keeping its panels as they are. */
+  onStepImage: (delta: 1 | -1) => void;
   /** The cut's own length, so reveal times can be resolved as they will play. */
   sceneSeconds: number;
   src: string;
@@ -440,6 +445,9 @@ function SliceCueField({
   onSetCue,
   canStep,
   onStepSlice,
+  phrases,
+  transcriptOpen,
+  onTranscriptToggle,
 }: {
   slice: SliceShape;
   narrationText: string | null;
@@ -449,6 +457,11 @@ function SliceCueField({
   onSetCue: (sliceId: string, cue: string) => string | null;
   canStep: boolean;
   onStepSlice: (delta: 1 | -1) => void;
+  /** Every cue on this image, so the transcript can show which words are claimed. */
+  phrases: string[];
+  /** Kept in the dialog, so stepping slices or images does not close it. */
+  transcriptOpen: boolean;
+  onTranscriptToggle: (open: boolean) => void;
 }) {
   const [draft, setDraft] = useState(slice.cue ?? "");
   const [error, setError] = useState<string | null>(null);
@@ -534,9 +547,23 @@ function SliceCueField({
       ) : null}
       {error ? <p className="slice-cue-error">{error}</p> : null}
       {saved ? <p className="slice-cue-saved">Saved.</p> : null}
-      <details className="slice-cue-transcript">
+      <details
+        className="slice-cue-transcript"
+        open={transcriptOpen}
+        onToggle={(event) => onTranscriptToggle(event.currentTarget.open)}
+      >
         <summary>Voice transcript</summary>
-        <p>{narrationText}</p>
+        <p>
+          {cuePhraseSegments(narrationText, phrases).map((segment, index) =>
+            segment.hit ? (
+              <mark key={index} className="slice-cue-hit">
+                {segment.text}
+              </mark>
+            ) : (
+              <span key={index}>{segment.text}</span>
+            ),
+          )}
+        </p>
       </details>
     </div>
   );
@@ -546,6 +573,8 @@ function SliceCueField({
 export function SliceEditorDialog({
   name,
   imageNumber,
+  imageTotal,
+  onStepImage,
   sceneSeconds,
   src,
   slices,
@@ -569,6 +598,9 @@ export function SliceEditorDialog({
   const [mapReport, setMapReport] = useState<SliceMapReport | null>(null);
   const [copied, setCopied] = useState(false);
   const [projectCopied, setProjectCopied] = useState(false);
+  // Panels belong to the slicer, not to the thing being sliced: stepping to
+  // another slice or image must not close the transcript or the map.
+  const [transcriptOpen, setTranscriptOpen] = useState(false);
   // Rows stay in permanent number order, so moving a slice never renumbers it
   // or shuffles the list — only its Position changes.
   const total = slices.length;
@@ -659,6 +691,33 @@ export function SliceEditorDialog({
         </header>
         <div className="slice-dialog-body">
           <div className="slice-stage">
+            {imageTotal > 1 && (
+              <div className="slice-image-nav">
+                <button
+                  type="button"
+                  className="slice-image-step"
+                  disabled={imageNumber <= 1}
+                  aria-label="Previous image"
+                  title="Previous image"
+                  onClick={() => onStepImage(-1)}
+                >
+                  <ChevronLeft size={13} />
+                </button>
+                <span className="slice-image-count">
+                  Image {imageNumber} of {imageTotal}
+                </span>
+                <button
+                  type="button"
+                  className="slice-image-step"
+                  disabled={imageNumber >= imageTotal}
+                  aria-label="Next image"
+                  title="Next image"
+                  onClick={() => onStepImage(1)}
+                >
+                  <ChevronRight size={13} />
+                </button>
+              </div>
+            )}
             <SliceSurface
               src={src}
               slices={slices}
@@ -793,6 +852,9 @@ export function SliceEditorDialog({
                     const next = labelled[(index + delta + labelled.length) % labelled.length];
                     if (next) onSelect(next.id);
                   }}
+                  phrases={slices.map((slice) => slice.cue ?? "")}
+                  transcriptOpen={transcriptOpen}
+                  onTranscriptToggle={setTranscriptOpen}
                 />
               ) : (
                 <p className="slice-cue-empty">Select a slice to give it a trigger phrase.</p>

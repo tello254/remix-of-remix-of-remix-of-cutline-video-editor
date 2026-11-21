@@ -589,8 +589,13 @@
 .slice-dialog-close { width: 26px; height: 26px; display: grid; place-items: center; padding: 0; color: var(--muted-foreground); background: var(--editor-lane); border: 1px solid var(--editor-separator); border-radius: 5px; cursor: pointer; }
 .slice-dialog-close:hover { color: var(--foreground); border-color: color-mix(in oklab, var(--primary) 50%, transparent); }
 .slice-dialog-body { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr) 286px; }
-.slice-stage { display: flex; flex-direction: column; gap: 9px; min-width: 0; min-height: 0; padding: 14px; }
+.slice-stage { position: relative; display: flex; flex-direction: column; gap: 9px; min-width: 0; min-height: 0; padding: 14px; }
 .slice-stage .slice-surface { flex: 1; min-height: 0; border: 1px solid var(--editor-separator); border-radius: 6px; }
+.slice-image-nav { position: absolute; top: 22px; left: 22px; z-index: 7; display: flex; align-items: center; gap: 5px; padding: 3px 7px 3px 4px; color: var(--foreground); background: color-mix(in oklab, var(--editor-surface) 86%, transparent); border: 1px solid var(--editor-separator); border-radius: 999px; box-shadow: 0 1px 5px rgb(0 0 0 / 22%); backdrop-filter: blur(6px); }
+.slice-image-step { display: inline-flex; align-items: center; justify-content: center; width: 20px; height: 20px; padding: 0; color: var(--editor-soft); background: transparent; border: 0; border-radius: 50%; cursor: pointer; }
+.slice-image-step:hover:not(:disabled) { color: var(--foreground); background: color-mix(in oklab, var(--primary) 22%, transparent); }
+.slice-image-step:disabled { opacity: .3; cursor: default; }
+.slice-image-count { font-size: 9px; font-weight: 600; letter-spacing: .02em; white-space: nowrap; }
 .slice-tools { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
 .slice-tools button { height: 27px; display: inline-flex; align-items: center; gap: 5px; padding: 0 9px; color: var(--muted-foreground); background: var(--editor-lane); border: 1px solid var(--editor-separator); border-radius: 5px; font: inherit; font-size: 10px; cursor: pointer; transition: color .15s, background .15s, border-color .15s; }
 .slice-tools button:hover { color: var(--foreground); border-color: color-mix(in oklab, var(--primary) 50%, transparent); }
@@ -632,6 +637,7 @@
 .slice-cue-transcript { color: var(--editor-soft); font-size: 8.5px; }
 .slice-cue-transcript summary { cursor: pointer; }
 .slice-cue-transcript p { max-height: 90px; overflow-y: auto; margin: 4px 0 0; padding: 5px 6px; color: var(--muted-foreground); background: var(--editor-surface); border-radius: 4px; font-size: 9px; line-height: 1.4; }
+.slice-cue-hit { color: #14532d; background: #bbf7d0; border-radius: 2px; padding: 0 1px; }
 .slice-align-panel { display: flex; flex-direction: column; gap: 4px; }
 .slice-align-button { display: inline-flex; align-items: center; justify-content: center; gap: 5px; height: 27px; color: var(--primary-foreground); background: var(--primary); border: 0; border-radius: 4px; font: inherit; font-size: 10px; font-weight: 600; cursor: pointer; }
 .slice-align-button:hover:not(:disabled) { filter: brightness(1.08); }
