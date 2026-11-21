@@ -8,6 +8,7 @@ import {
   ClipboardPaste,
   Check,
   Expand,
+  Layers,
   MousePointer2,
   PenLine,
   Sparkles,
@@ -402,6 +403,8 @@ type SliceEditorDialogProps = {
   onCreate: (points: SlicePoint[]) => void;
   onChangePoints: (id: string, points: SlicePoint[]) => void;
   onImportMap: (text: string) => SliceMapReport;
+  /** Serialises every sliced image in the project as one bundle. */
+  onCopyProject: () => string;
   onReorder: (id: string, order: number) => void;
   onDelete: (id: string) => void;
   onClear: () => void;
@@ -551,6 +554,7 @@ export function SliceEditorDialog({
   onCreate,
   onChangePoints,
   onImportMap,
+  onCopyProject,
   onReorder,
   onDelete,
   onClear,
@@ -564,6 +568,7 @@ export function SliceEditorDialog({
   const [mapText, setMapText] = useState("");
   const [mapReport, setMapReport] = useState<SliceMapReport | null>(null);
   const [copied, setCopied] = useState(false);
+  const [projectCopied, setProjectCopied] = useState(false);
   // Rows stay in permanent number order, so moving a slice never renumbers it
   // or shuffles the list — only its Position changes.
   const total = slices.length;
@@ -578,11 +583,13 @@ export function SliceEditorDialog({
     ).slices.map((timing) => [timing.id, timing]),
   );
   // A slice nobody cued is still given a default slot; showing that as a reveal
-  // time would claim knowledge the narration never provided.
-  const revealOf = (slice: SliceShape) =>
-    (slice.cue ?? "").trim() || slice.timing?.intendedStart !== undefined
-      ? revealById.get(slice.id)?.start
-      : undefined;
+  // time would claim knowledge the narration never provided. The same goes for
+  // a cued slice whose words are not in this scene: it has no reveal at all.
+  const revealOf = (slice: SliceShape) => {
+    if (!(slice.cue ?? "").trim() && slice.timing?.intendedStart === undefined) return undefined;
+    const timing = revealById.get(slice.id);
+    return timing?.flags.includes("unplaced") ? undefined : timing?.start;
+  };
   const cued = slices.filter((slice) => (slice.cue ?? "").trim()).length;
   const alignBlocked =
     narrationText === null
@@ -599,15 +606,11 @@ export function SliceEditorDialog({
     if (report.errors.length === 0) setMode("select");
   };
 
-  const copyMap = () => {
-    const text = serializeSliceMap(slices, { image: imageNumber, file: name });
-    const done = () => {
-      setCopied(true);
-      window.setTimeout(() => setCopied(false), 1600);
-    };
+  // Clipboard access can be denied; putting the JSON in the map box still lets
+  // the user copy it by hand, so an export never disappears silently.
+  const copyText = (text: string, done: () => void) => {
     if (navigator.clipboard?.writeText) {
       void navigator.clipboard.writeText(text).then(done).catch(() => {
-        // Clipboard denied: leave the map in the box so it can be copied by hand.
         setMapOpen(true);
         setMapText(text);
       });
@@ -615,6 +618,20 @@ export function SliceEditorDialog({
     }
     setMapOpen(true);
     setMapText(text);
+  };
+
+  const copyMap = () => {
+    copyText(serializeSliceMap(slices, { image: imageNumber, file: name }), () => {
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1600);
+    });
+  };
+
+  const copyProjectMap = () => {
+    copyText(onCopyProject(), () => {
+      setProjectCopied(true);
+      window.setTimeout(() => setProjectCopied(false), 1600);
+    });
   };
 
   return createPortal(
@@ -834,6 +851,15 @@ export function SliceEditorDialog({
                     <button type="button" disabled={total === 0} onClick={copyMap}>
                       {copied ? <Check size={11} /> : <ClipboardPaste size={11} />}
                       {copied ? "Copied" : "Copy current"}
+                    </button>
+                    <button
+                      type="button"
+                      disabled={total === 0}
+                      title="Copy every sliced image in the project as one bundle"
+                      onClick={copyProjectMap}
+                    >
+                      {projectCopied ? <Check size={11} /> : <Layers size={11} />}
+                      {projectCopied ? "Copied all" : "Copy all images"}
                     </button>
                   </div>
                   {mapReport && (

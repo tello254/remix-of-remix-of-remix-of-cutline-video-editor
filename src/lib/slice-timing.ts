@@ -81,7 +81,13 @@ export type SliceTimingFlag =
   /** The slice now begins before the words that describe it. */
   | "early"
   /** Its words were not found, so its place was fitted between its neighbours. */
-  | "estimated";
+  | "estimated"
+  /**
+   * The slice has a cue but no place in this scene: alignment could not find
+   * its words (they belong to another image), so it has no reveal at all. The
+   * engine must not paint it on a guessed uniform slot.
+   */
+  | "unplaced";
 
 export type ResolvedSliceTiming = {
   id: string;
@@ -102,7 +108,12 @@ export type SliceTimingResolution = {
   sceneSeconds: number;
 };
 
-type SliceLike = { id: string; timing?: SliceTimingInput | undefined };
+type SliceLike = {
+  id: string;
+  /** Present on real slices; a cued scene never schedules uncued slices blindly. */
+  cue?: string | undefined;
+  timing?: SliceTimingInput | undefined;
+};
 
 /**
  * What the engine's uniform slicer would have done, expressed as authored
@@ -149,6 +160,13 @@ export function resolveSliceTiming(
   const defaultMinHold = options?.minHold ?? MIN_SLICE_HOLD;
   if (!orderedSlices.length) return { slices: [], sceneSeconds: scene };
 
+  // A scene whose slices carry trigger phrases is timed by the narration. Only
+  // a scene with no cues at all keeps the uniform fallback. Otherwise a slice
+  // that alignment could not place (its words belong to another image) would
+  // still steal a default slot ahead of the cues that *were* measured, which is
+  // exactly what makes reveals look like they animate wherever they like.
+  const cuedScene = orderedSlices.some((slice) => (slice.cue ?? "").trim().length > 0);
+
   const defaults = defaultSliceTimings(orderedSlices.length, scene);
   const authored = orderedSlices.map((slice, index) => {
     const timing = slice.timing ?? {};
@@ -157,23 +175,36 @@ export function resolveSliceTiming(
     // paint time and the hold absorbs the rest, so growing the scene to fit a
     // long voice never turns a one-second drawing into a slow one.
     const placed = timing.intendedStart !== undefined || (timing.anchorStart ?? null) !== null;
+    const unplaced = cuedScene && !placed;
     return {
       id: slice.id,
-      intended: timing.intendedStart ?? defaults[index]?.intendedStart ?? 0,
-      animation: Math.max(
-        EPSILON,
-        timing.animation ?? (placed ? naturalSliceAnimation() : defaults[index]?.animation) ?? 1,
-      ),
+      unplaced,
+      intended: unplaced ? 0 : timing.intendedStart ?? defaults[index]?.intendedStart ?? 0,
+      animation: unplaced
+        ? 0
+        : Math.max(
+            EPSILON,
+            timing.animation ?? (placed ? naturalSliceAnimation() : defaults[index]?.animation) ?? 1,
+          ),
       minHold: timing.minHold ?? defaultMinHold,
-      override: timing.startOverride ?? null,
-      anchorStart: timing.anchorStart ?? null,
+      override: unplaced ? null : (timing.startOverride ?? null),
+      anchorStart: unplaced ? null : (timing.anchorStart ?? null),
     };
   });
 
   // Desired starts first: they come from the anchors and overrides alone.
-  const desired = authored.map(
-    (slice) => slice.override ?? slice.anchorStart ?? slice.intended,
+  const desired = authored.map((slice) =>
+    slice.unplaced ? null : (slice.override ?? slice.anchorStart ?? slice.intended),
   );
+
+  // The next slice that owns a reveal. An unplaced slice must not shorten the
+  // animation of the slice before it, nor push the one after it.
+  const nextPlaced = (index: number) => {
+    for (let cursor = index + 1; cursor < authored.length; cursor += 1) {
+      if (!authored[cursor]?.unplaced) return cursor;
+    }
+    return -1;
+  };
 
   // One forward pass. A reveal may be shortened to fit before the *next*
   // slice's intended start — drawing a little faster is always preferable to
@@ -184,6 +215,19 @@ export function resolveSliceTiming(
   let previousRevealEnd = 0;
 
   authored.forEach((slice, index) => {
+    if (slice.unplaced) {
+      slices.push({
+        id: slice.id,
+        start: 0,
+        animation: 0,
+        animEnd: 0,
+        hold: 0,
+        lag: 0,
+        flags: ["unplaced"],
+      });
+      return;
+    }
+
     const flags: SliceTimingFlag[] = [];
     const want = desired[index] ?? 0;
     let start = Math.max(want, previousRevealEnd);
@@ -195,8 +239,9 @@ export function resolveSliceTiming(
 
     start = Math.max(0, Math.min(start, Math.max(0, scene - minAnimation)));
 
-    const nextDesired = desired[index + 1] ?? scene;
-    const nextIntended = authored[index + 1]?.intended ?? scene;
+    const next = nextPlaced(index);
+    const nextDesired = (next >= 0 ? desired[next] : null) ?? scene;
+    const nextIntended = (next >= 0 ? authored[next]?.intended : null) ?? scene;
     // Room is measured against whichever of the next slice's positions is
     // later. A slice dragged *earlier* than its cue must not eat into the
     // previous reveal — it gets clamped instead, and the previous slice keeps
@@ -225,7 +270,11 @@ export function resolveSliceTiming(
   // slice's start. A lag on the next slice may sit on top of it.
   return {
     slices: slices.map((slice, index) => {
-      const nextStart = index + 1 < slices.length ? (slices[index + 1]?.start ?? scene) : scene;
+      if (slice.flags.includes("unplaced")) {
+        return { ...slice, flags: [...new Set(slice.flags)] };
+      }
+      const next = nextPlaced(index);
+      const nextStart = next >= 0 ? (slices[next]?.start ?? scene) : scene;
       const hold = Math.max(0, Math.max(slice.start, nextStart) - slice.animEnd);
       const sliceMinHold = authored[index]?.minHold ?? defaultMinHold;
       const flags = [...slice.flags];

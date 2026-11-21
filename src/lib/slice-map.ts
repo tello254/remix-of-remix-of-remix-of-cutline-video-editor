@@ -483,6 +483,213 @@ export function parseSliceMap(
   return { slices, errors, warnings, space, coverage: coveredFraction(slices) };
 }
 
+/** One image's share of a multi-image bundle, parsed on its own. */
+export type SliceMapImage = {
+  /** 1-based position inside the bundle, in the order the model wrote it. */
+  index: number;
+  /** The bundle's own image number, when it declared one. */
+  image?: number | undefined;
+  /** The image's file or library title, used to match the timeline. */
+  file?: string | undefined;
+  scene?: string | undefined;
+  slices: ParsedSlice[];
+  errors: SliceMapIssue[];
+  warnings: SliceMapIssue[];
+  space: SliceMapSpace;
+  coverage: number;
+};
+
+export type SliceMapBundleReport = {
+  /** Every described image, in bundle order. Empty when the map was rejected. */
+  images: SliceMapImage[];
+  errors: SliceMapIssue[];
+  warnings: SliceMapIssue[];
+  space: SliceMapSpace;
+};
+
+function readJson(input: string | unknown): { value: unknown } | { error: SliceMapIssue } {
+  if (typeof input !== "string") return { value: input };
+  if (!input.trim()) return { error: { path: "map", message: "The slice map is empty." } };
+  try {
+    return { value: JSON.parse(input) };
+  } catch (error) {
+    return {
+      error: {
+        path: "map",
+        message: `That is not valid JSON: ${
+          error instanceof Error ? error.message : "parse failed"
+        }`,
+      },
+    };
+  }
+}
+
+function imageTitle(entry: Record<string, unknown>) {
+  for (const key of ["file", "name", "title"]) {
+    const value = entry[key];
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return undefined;
+}
+
+function imageNumber(entry: Record<string, unknown>) {
+  const value = asNumber(entry["image"] ?? entry["number"]);
+  return value !== null && Number.isInteger(value) && value >= 1 ? value : undefined;
+}
+
+/**
+ * Parses *every* image in a bundle, not just one scene.
+ *
+ * Pasting a whole-project map should lay down all of its images in one action,
+ * so the editor can match each entry to the clip whose title it names and put
+ * the timeline in the bundle's order. Entries are parsed independently: one bad
+ * polygon rejects that image, and the caller refuses the whole import rather
+ * than half-applying it.
+ */
+export function parseSliceMapBundle(
+  input: string | unknown,
+  options?: ParseSliceMapOptions,
+): SliceMapBundleReport {
+  const space = options?.defaultSpace ?? "normalized";
+  const empty = (errors: SliceMapIssue[]): SliceMapBundleReport => ({
+    images: [],
+    errors,
+    warnings: [],
+    space,
+  });
+
+  const parsed = readJson(input);
+  if ("error" in parsed) return empty([parsed.error]);
+  const value = parsed.value;
+
+  const containers =
+    isRecord(value) && Array.isArray(value["images"])
+      ? value["images"]
+      : isRecord(value) && Array.isArray(value["scenes"])
+        ? value["scenes"]
+        : null;
+
+  if (containers) {
+    const described = containers.filter((entry) => Array.isArray(sliceListOf(entry)));
+    if (!described.length) {
+      return empty([{ path: "images", message: "This bundle does not describe any image." }]);
+    }
+    const root = isRecord(value) ? value : {};
+    const images: SliceMapImage[] = described.map((entry, index) => {
+      const container = isRecord(entry) ? entry : {};
+      // Parse this one image as if it were a standalone map. Root-level space
+      // and pixel dimensions still apply, but the image's own values win.
+      const single = parseSliceMap(
+        {
+          ...root,
+          ...container,
+          space: container["space"] ?? root["space"],
+          width: container["width"] ?? root["width"],
+          height: container["height"] ?? root["height"],
+          images: undefined,
+          scenes: undefined,
+        },
+        options,
+      );
+      return {
+        index: index + 1,
+        image: imageNumber(container) ?? index + 1,
+        file: imageTitle(container),
+        scene:
+          typeof container["scene"] === "string" && container["scene"].trim()
+            ? container["scene"].trim()
+            : undefined,
+        slices: single.slices,
+        errors: single.errors,
+        warnings: single.warnings,
+        space: single.space,
+        coverage: single.coverage,
+      };
+    });
+    const errors = images.flatMap((image) =>
+      image.errors.map((issue) => ({
+        path: `images[${image.index - 1}].${issue.path}`,
+        message: issue.message,
+      })),
+    );
+    const warnings = images.flatMap((image) =>
+      image.warnings.map((issue) => ({
+        path: `images[${image.index - 1}].${issue.path}`,
+        message: issue.message,
+      })),
+    );
+    return { images, errors, warnings, space: images[0]?.space ?? space };
+  }
+
+  // A single-image map is a bundle of one, so every caller can use one path.
+  const single = parseSliceMap(input, options);
+  return {
+    images: single.errors.length
+      ? []
+      : [
+          {
+            index: 1,
+            image: 1,
+            file: options?.fileName,
+            slices: single.slices,
+            errors: single.errors,
+            warnings: single.warnings,
+            space: single.space,
+            coverage: single.coverage,
+          },
+        ],
+    errors: single.errors,
+    warnings: single.warnings,
+    space: single.space,
+  };
+}
+
+export type SliceMapImageInput = {
+  /** 1-based play position among the project's images. */
+  image?: number | undefined;
+  /** The image's file or library title. */
+  file?: string | undefined;
+  scene?: string | undefined;
+  slices: {
+    order: number;
+    number?: number | undefined;
+    cue?: string | undefined;
+    points: SliceMapPoint[];
+  }[];
+};
+
+/**
+ * Serialises a whole project: one entry per image, in play order.
+ *
+ * This is what "copy all images" writes, so a manual slicing session can be
+ * handed to another chat — or back into Cutline — without exporting each image
+ * separately and losing their order.
+ */
+export function serializeSliceMapProject(
+  images: SliceMapImageInput[],
+  options?: { pretty?: boolean },
+) {
+  const round = (value: number) => Math.round(value * 10000) / 10000;
+  const map = {
+    schema: SLICE_MAP_SCHEMA,
+    space: "normalized" as const,
+    images: images.map((entry) => ({
+      ...(entry.image ? { image: entry.image } : {}),
+      ...(entry.file ? { file: entry.file } : {}),
+      ...(entry.scene ? { scene: entry.scene } : {}),
+      slices: [...entry.slices]
+        .sort((a, b) => a.order - b.order)
+        .map((slice, index) => ({
+          number: slice.number ?? index + 1,
+          order: slice.order,
+          ...(slice.cue ? { cue: slice.cue } : {}),
+          points: slice.points.map((point) => [round(point.x), round(point.y)]),
+        })),
+    })),
+  };
+  return JSON.stringify(map, null, options?.pretty === false ? 0 : 2);
+}
+
 export type SerializeSliceMapOptions = {
   pretty?: boolean;
   /** 1-based play position of this image on the timeline. */

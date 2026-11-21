@@ -25,6 +25,46 @@ describe("slice timing schedule", () => {
     expect(defaults[1]?.intendedStart ?? 0).toBeGreaterThan(defaults[0]?.intendedStart ?? 0);
   });
 
+  it("never gives an unplaced cue a uniform slot ahead of the measured ones", () => {
+    // Slice 1 was imported with a cue but its words belong to another image, so
+    // it has no timing. It must not reserve the first slot and push slice 2 —
+    // that is what makes reveals look like they animate wherever they like.
+    const { slices } = resolveSliceTiming(
+      [
+        { id: "a", cue: "an earlier scene" },
+        { id: "b", cue: "this scene", timing: { intendedStart: 0.3, anchorStart: 0.3, animation: 1 } },
+      ],
+      6,
+    );
+
+    expect(slices[0]?.flags).toContain("unplaced");
+    near(slices[0]?.animation ?? -1, 0);
+    near(slices[0]?.animEnd ?? -1, 0);
+    near(slices[1]?.start ?? -1, 0.3);
+    expect(slices[1]?.flags).not.toContain("clamped");
+  });
+
+  it("keeps the uniform schedule when a scene has no cues at all", () => {
+    const { slices } = resolveSliceTiming([{ id: "a" }, { id: "b" }], 4);
+    expect(slices[0]?.animation ?? 0).toBeGreaterThan(0);
+    expect(slices.some((slice) => slice.flags.includes("unplaced"))).toBe(false);
+  });
+
+  it("measures hold to the next placed slice, skipping an unplaced one", () => {
+    const { slices } = resolveSliceTiming(
+      [
+        { id: "a", cue: "first", timing: { intendedStart: 0, animation: 1 } },
+        { id: "b", cue: "belongs elsewhere" },
+        { id: "c", cue: "third", timing: { intendedStart: 3, animation: 1 } },
+      ],
+      6,
+    );
+
+    expect(slices[1]?.flags).toContain("unplaced");
+    // Slice 1 holds until slice 3 starts, not until the empty slice 2.
+    near(slices[0]?.hold ?? -1, 2);
+  });
+
   it("surfaces an estimated placement as its own flag", () => {
     const { slices } = resolveSliceTiming(
       [

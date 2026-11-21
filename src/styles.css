@@ -399,6 +399,8 @@
 .slice-flag:hover { background: #fde047; }
 .slice-flag.estimated { color: #082f49; background: #7dd3fc; }
 .slice-flag.estimated:hover { background: #bae6fd; }
+.slice-flag.unplaced { color: #1c1917; background: #d6d3d1; }
+.slice-flag.unplaced:hover { background: #e7e5e4; }
 .slice-flag-menu { min-width: 13rem; font-size: .78rem; }
 .clip-block > .clip-thumb, .clip-block > .clip-label, .clip-block > .clip-duration, .clip-block > .clip-audio-shipped { position: relative; z-index: 1; text-shadow: 0 1px 2px rgb(0 0 0 / 85%); }
 .clip-block.image::after, .clip-block.video::after { position: absolute; inset: 0; z-index: 0; background: linear-gradient(90deg, rgb(4 8 10 / 78%), rgb(4 8 10 / 22%) 58%, rgb(4 8 10 / 45%)); content: ""; pointer-events: none; }

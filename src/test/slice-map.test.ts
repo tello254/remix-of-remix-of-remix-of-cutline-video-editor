@@ -3,7 +3,9 @@ import { describe, expect, it } from "vitest";
 import {
   isSelfIntersecting,
   parseSliceMap,
+  parseSliceMapBundle,
   serializeSliceMap,
+  serializeSliceMapProject,
   type SliceMapIssue,
 } from "@/lib/slice-map";
 
@@ -259,6 +261,49 @@ describe("parseSliceMap", () => {
     expect(fallback.slices).toHaveLength(1);
   });
 
+  it("parses every image in a bundle so one paste can cover the timeline", () => {
+    const bundle = {
+      schema: "cutline.slice-map/1",
+      space: "normalized",
+      images: [
+        { image: 2, file: "scene-02.png", scene: "the meal", slices: [{ points: square, cue: "two" }] },
+        {
+          image: 1,
+          file: "scene-01.png",
+          slices: [{ points: square }, { points: square }],
+        },
+      ],
+    };
+
+    const result = parseSliceMapBundle(bundle);
+
+    expect(result.errors).toEqual([]);
+    expect(result.images.map((image) => image.file)).toEqual(["scene-02.png", "scene-01.png"]);
+    expect(result.images.map((image) => image.image)).toEqual([2, 1]);
+    expect(result.images.map((image) => image.slices.length)).toEqual([1, 2]);
+    expect(result.images[0]?.scene).toBe("the meal");
+    expect(result.images[0]?.slices[0]?.cue).toBe("two");
+  });
+
+  it("names the broken image instead of half-importing a bundle", () => {
+    const result = parseSliceMapBundle({
+      images: [
+        { image: 1, file: "good.png", slices: [{ points: square }] },
+        { image: 2, file: "bad.png", slices: [{ points: [[0, 0], [1, 1]] }] },
+      ],
+    });
+
+    expect(result.images[1]?.errors[0]?.path).toContain("points");
+    expect(result.errors[0]?.path).toContain("images[1]");
+  });
+
+  it("treats a single-image map as a bundle of one", () => {
+    const result = parseSliceMapBundle({ slices: [{ points: square }] });
+    expect(result.errors).toEqual([]);
+    expect(result.images).toHaveLength(1);
+    expect(result.images[0]?.slices).toHaveLength(1);
+  });
+
   it("exports the image, slice numbers and trigger phrases", () => {
     const points = square.map(([x, y]) => ({ x: x ?? 0, y: y ?? 0 }));
     const map = JSON.parse(
@@ -296,6 +341,37 @@ describe("parseSliceMap", () => {
           [0.1, 0.4],
         ],
       },
+    ]);
+  });
+
+  it("exports every image in one bundle that re-imports unchanged", () => {
+    const points = square.map(([x, y]) => ({ x: x ?? 0, y: y ?? 0 }));
+    const text = serializeSliceMapProject([
+      {
+        image: 2,
+        file: "scene-02.png",
+        slices: [{ order: 1, number: 1, cue: "the meal", points }],
+      },
+      {
+        image: 1,
+        file: "scene-01.png",
+        slices: [
+          { order: 2, number: 2, cue: "the bully", points },
+          { order: 1, number: 1, points },
+        ],
+      },
+    ]);
+
+    const parsed = parseSliceMapBundle(text);
+
+    expect(parsed.errors).toEqual([]);
+    expect(parsed.images.map((image) => [image.image, image.file])).toEqual([
+      [2, "scene-02.png"],
+      [1, "scene-01.png"],
+    ]);
+    expect(parsed.images[1]?.slices.map((slice) => [slice.number, slice.order, slice.cue])).toEqual([
+      [1, 1, undefined],
+      [2, 2, "the bully"],
     ]);
   });
 });

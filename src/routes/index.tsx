@@ -74,7 +74,14 @@ import {
 import { buildFilmstrip, cachedFilmstrip, filmstripKey } from "@/lib/clip-filmstrip";
 import { shouldAutoTranscribe } from "@/lib/asr-policy";
 import { loadStoredMedia, requestPersistentStorage, storeMediaFile } from "@/lib/media-store";
-import { parseSliceMap, type SliceMapReport } from "@/lib/slice-map";
+import {
+  parseSliceMapBundle,
+  serializeSliceMapProject,
+  type ParsedSlice,
+  type SliceMapImage,
+  type SliceMapIssue,
+  type SliceMapReport,
+} from "@/lib/slice-map";
 import { ensureMinimumPoints } from "@/lib/slice-geometry";
 import { alignScriptToTranscript } from "@/lib/script-align";
 import { syncSliceBeats, syncSliceCues, narrationBeats } from "@/lib/slice-sync";
@@ -380,21 +387,172 @@ const SLICE_FLAG_TEXT: Record<SliceTimingFlag, string> = {
   override: "start moved by hand",
   early: "starts before the narration describes it",
   estimated: "placed by rule, not by its words",
+  unplaced: "not spoken in this scene",
 };
+
+function slicesFromMap(slices: ParsedSlice[]): SliceShape[] {
+  return slices.map((slice, index) => ({
+    id: makeId(),
+    number: slice.number ?? index + 1,
+    order: slice.order,
+    points: slice.points.map((point) => ({ x: point.x, y: point.y })),
+    ...(slice.cue ? { cue: slice.cue } : {}),
+  }));
+}
+
+/** Replaces the slices of several clips in one project update. */
+function applySlicesToClips(
+  project: Project,
+  applications: { clip: Clip; shapes: SliceShape[] }[],
+): Project {
+  const byId = new Map(applications.map((entry) => [entry.clip.id, entry.shapes]));
+  return {
+    ...project,
+    clips: project.clips.map((clip) => {
+      const shapes = byId.get(clip.id);
+      if (!shapes) return clip;
+      const next = normalizeSlices(shapes);
+      const animation = resolveWhiteboard(clip, project.settings);
+      return {
+        ...clip,
+        slices: next.length ? next : undefined,
+        // An imported slice list is allowed to make the scene longer; a hand
+        // trim from before the map must not cap it.
+        ...(next.length ? { durationLocked: false } : {}),
+        ...(next.length && !animation.enabled
+          ? {
+              whiteboardOverride: true,
+              whiteboard: makeWhiteboardConfig({ ...animation, enabled: true }),
+            }
+          : {}),
+      };
+    }),
+  };
+}
+
+/** File names are compared without folders, extensions, case or punctuation. */
+function imageTitleKey(value: string) {
+  return value
+    .toLowerCase()
+    .replace(/^.*[\\/]/, "")
+    .replace(/\.[^.]+$/, "")
+    .replace(/[^a-z0-9]+/g, "");
+}
+
+/**
+ * Finds the clip each bundle entry describes.
+ *
+ * The title is the identity: a map that says `john-and-the-bully.png` belongs
+ * to that image wherever it was dropped on the timeline. Only when a title is
+ * absent or ambiguous does the bundle's own image number, then the list
+ * position, decide. An unmatched entry aborts the import rather than landing a
+ * map on the wrong picture.
+ */
+function matchBundleImages(images: SliceMapImage[], clips: Clip[]) {
+  const used = new Set<string>();
+  const matches: { entry: SliceMapImage; clip: Clip }[] = [];
+  const errors: SliceMapIssue[] = [];
+
+  images.forEach((entry) => {
+    if (!entry.file) return;
+    const wanted = imageTitleKey(entry.file);
+    if (!wanted) return;
+    const exact = clips.filter((clip) => !used.has(clip.id) && imageTitleKey(clip.name) === wanted);
+    if (exact.length === 1) {
+      used.add(exact[0]!.id);
+      matches.push({ entry, clip: exact[0]! });
+      return;
+    }
+    const partial = clips.filter(
+      (clip) =>
+        !used.has(clip.id) &&
+        (imageTitleKey(clip.name).includes(wanted) || wanted.includes(imageTitleKey(clip.name))),
+    );
+    if (partial.length === 1) {
+      used.add(partial[0]!.id);
+      matches.push({ entry, clip: partial[0]! });
+    }
+  });
+
+  images.forEach((entry) => {
+    if (matches.some((match) => match.entry.index === entry.index)) return;
+    const slot = entry.image ? clips[entry.image - 1] : undefined;
+    if (slot && !used.has(slot.id)) {
+      used.add(slot.id);
+      matches.push({ entry, clip: slot });
+    }
+  });
+
+  if (matches.length < images.length && images.length === clips.length) {
+    const free = clips.filter((clip) => !used.has(clip.id));
+    images
+      .filter((entry) => !matches.some((match) => match.entry.index === entry.index))
+      .forEach((entry, index) => {
+        const clip = free[index];
+        if (!clip) return;
+        used.add(clip.id);
+        matches.push({ entry, clip });
+      });
+  }
+
+  if (matches.length !== images.length) {
+    const missing = images
+      .filter((entry) => !matches.some((match) => match.entry.index === entry.index))
+      .map((entry) => entry.file ?? `image ${entry.image ?? entry.index}`)
+      .join(", ");
+    errors.push({
+      path: "images",
+      message: `Could not match ${missing} to an image on the timeline. Nothing was imported.`,
+    });
+  }
+
+  return { matches: matches.sort((a, b) => a.entry.index - b.entry.index), errors };
+}
+
+/** Packs the matched images into the bundle's order, starting where they were. */
+function orderImageClips(project: Project, trackId: string, orderedIds: string[]) {
+  const clips = orderedIds
+    .map((id) => project.clips.find((clip) => clip.id === id))
+    .filter((clip): clip is Clip => Boolean(clip));
+  if (clips.length !== orderedIds.length) return project;
+  if (clips.some((clip) => clip.trackId !== trackId)) return project;
+
+  const starts = new Map<string, number>();
+  let cursor = Math.min(...clips.map((clip) => clip.start));
+  orderedIds.forEach((id) => {
+    const clip = clips.find((entry) => entry.id === id);
+    if (!clip) return;
+    starts.set(id, Math.round(cursor * 1000) / 1000);
+    cursor += clip.duration;
+  });
+
+  let changed = false;
+  const next = project.clips.map((clip) => {
+    const start = starts.get(clip.id);
+    if (start === undefined || Math.abs(start - clip.start) < 1e-6) return clip;
+    changed = true;
+    return { ...clip, start };
+  });
+  return changed ? { ...project, clips: next } : project;
+}
 
 /**
  * Turns the clip's authored timing into the fractions the engine paints in.
  * Slices without authored timing fall back to the uniform schedule, so older
- * projects keep exactly the reveal they had before.
+ * projects keep exactly the reveal they had before. A slice whose cue could not
+ * be placed in this scene is dropped instead: painting it on a guessed slot is
+ * worse than leaving it out, and the editor already reports it.
  */
 function bandedSlices(clip: Clip): SliceShape[] {
   const ordered = [...(clip.slices ?? [])].sort((a, b) => a.order - b.order);
   const { slices: timings, sceneSeconds } = resolveSliceTiming(ordered, clip.duration);
   const bands = timingBands(timings, sceneSeconds);
-  return ordered.map((slice, index) => ({
-    ...slice,
-    band: bands[index] ?? { start: 0, end: 0 },
-  }));
+  return ordered
+    .map((slice, index) => ({
+      ...slice,
+      band: bands[index] ?? { start: 0, end: 0 },
+    }))
+    .filter((slice) => (slice.band?.end ?? 0) - (slice.band?.start ?? 0) > 1e-6);
 }
 
 /**
@@ -438,6 +596,167 @@ function narrationForClip(clip: Clip, clips: Clip[], tracks: Track[]) {
      * be drawn in 9 s still stays up for a 24 s voice.
      */
     endSeconds: audio.start + audio.duration - clip.start,
+  };
+}
+
+type SceneSyncReport = {
+  clipId: string;
+  timed: number;
+  estimated: number;
+  missing: number;
+  noCue: number;
+  clamped: number;
+  uncertain: number;
+  /** Seconds the scene grew by, for the status line. */
+  grew: number;
+};
+
+/** Solves one image's cues against the voice underneath it. */
+function solveScene(
+  clip: Clip,
+  narration: NonNullable<ReturnType<typeof narrationForClip>>,
+  settings: ProjectSettings,
+) {
+  const ordered = [...(clip.slices ?? [])].sort((a, b) => a.order - b.order);
+  const script = (settings.narrationScript ?? "").trim();
+  const cueBeats = ordered
+    .filter((slice) => (slice.cue ?? "").trim())
+    .map((slice) => ({ id: slice.id, cue: (slice.cue ?? "").trim() }));
+  // With a script, wording comes from the script and the transcript only says
+  // when it was heard. Without one, match each cue against the heard words.
+  const alignment = script
+    ? alignScriptToTranscript(script, cueBeats, narration.transcript.words)
+    : null;
+  const options = {
+    offsetSeconds: narration.offsetSeconds,
+    clipDuration: clip.duration,
+    // The solver may place a cue anywhere inside the voice under this image.
+    // How long the scene actually becomes is decided afterwards by the last
+    // reveal, never by a neighbour on the timeline.
+    maxDuration: Math.max(clip.duration, narration.endSeconds),
+    candidates: narrationBeats(narration.transcript.words),
+  };
+  const result = alignment
+    ? syncSliceBeats(
+        ordered,
+        alignment.beats.map((beat) => ({ id: beat.id, cue: beat.cue, anchor: beat.anchor })),
+        options,
+      )
+    : syncSliceCues(ordered, narration.transcript.words, options);
+  return { ordered, result, alignment };
+}
+
+/**
+ * Re-times every image on one row from the voice, left to right.
+ *
+ * A scene is exactly as long as its own slices need: the last reveal plus the
+ * end hold, with the picture's natural draw time as a floor. It is never
+ * capped by the next image. When it grows into a neighbour, that neighbour —
+ * and everything after it — is pushed later on the same row, then re-timed
+ * against its new position. Nothing shrinks on its own.
+ */
+function arrangeImageTrack(project: Project, trackId: string) {
+  const orderedClips = project.clips
+    .filter((clip) => clip.trackId === trackId && clip.kind === "visual")
+    .sort((a, b) => a.start - b.start || a.id.localeCompare(b.id));
+  const reports: SceneSyncReport[] = [];
+  if (!orderedClips.length) return { project, reports };
+
+  const working = new Map(project.clips.map((clip) => [clip.id, clip]));
+  const updates = new Map<string, Partial<Clip>>();
+  let shift = 0;
+
+  orderedClips.forEach((original, index) => {
+    const start = Math.max(0, original.start + shift);
+    const clip: Clip =
+      Math.abs(start - original.start) > 1e-6 ? { ...original, start } : original;
+    working.set(clip.id, clip);
+
+    const hasCues = (clip.slices ?? []).some((slice) => (slice.cue ?? "").trim());
+    if (clip.mediaType !== "image" || !hasCues) {
+      if (clip !== original) updates.set(clip.id, { start: clip.start });
+      return;
+    }
+
+    const narration = narrationForClip(clip, [...working.values()], project.tracks);
+    let duration = clip.duration;
+    let slices = clip.slices;
+    let report: SceneSyncReport | null = null;
+
+    if (narration) {
+      const { result, alignment } = solveScene(clip, narration, project.settings);
+      const needed = result.spanEnd + SLICE_END_HOLD;
+      duration = Math.max(clip.duration, Math.round(needed * 100) / 100);
+      const patches = new Map(result.patches.map((entry) => [entry.id, entry.timing]));
+      if (patches.size) {
+        let changed = false;
+        const nextSlices = (clip.slices ?? []).map((slice) => {
+          const timing = patches.get(slice.id);
+          if (!timing) return slice;
+          const current = slice.timing ?? {};
+          // Re-solving often produces the same numbers. Keeping the old object
+          // means an unchanged scene costs no undo step.
+          if (
+            current.intendedStart === timing.intendedStart &&
+            (current.anchorStart ?? null) === (timing.anchorStart ?? null) &&
+            current.estimated === timing.estimated &&
+            (current.animation ?? null) === (timing.animation ?? null) &&
+            (current.anchor?.time ?? null) === (timing.anchor?.time ?? null) &&
+            (current.anchor?.text ?? null) === (timing.anchor?.text ?? null)
+          ) {
+            return slice;
+          }
+          changed = true;
+          return { ...slice, timing: { ...slice.timing, ...timing } };
+        });
+        if (changed) slices = nextSlices;
+      }
+      report = {
+        clipId: clip.id,
+        timed: result.patches.length - result.estimated.length,
+        estimated: result.estimated.length,
+        missing: result.missing.length,
+        noCue: result.noCue.length,
+        clamped: result.clamped.length,
+        uncertain: alignment?.weak.length ?? 0,
+        grew: Math.max(0, duration - clip.duration),
+      };
+      reports.push(report);
+    }
+
+    const sameStart = Math.abs(clip.start - original.start) <= 1e-6;
+    const sameDuration = Math.abs(duration - clip.duration) <= 1e-6;
+    const updated: Clip =
+      slices === clip.slices && sameDuration ? clip : { ...clip, duration, slices };
+    working.set(clip.id, updated);
+    if (!sameStart || updated !== clip) {
+      updates.set(clip.id, {
+        start: updated.start,
+        duration: updated.duration,
+        slices: updated.slices,
+      });
+    }
+
+    // Push the next scene only as far as this one now reaches. Gaps the user
+    // left on the row are preserved until a reveal actually fills them.
+    const next = orderedClips[index + 1];
+    if (next) {
+      const nextStart = next.start + shift;
+      const end = clip.start + duration;
+      if (end > nextStart + 1e-6) shift += end - nextStart;
+    }
+  });
+
+  if (!updates.size) return { project, reports };
+  return {
+    project: {
+      ...project,
+      clips: project.clips.map((clip) => {
+        const update = updates.get(clip.id);
+        return update ? { ...clip, ...update } : clip;
+      }),
+    },
+    reports,
   };
 }
 
@@ -530,9 +849,12 @@ function ClipSlices({
         // collision, a missing hold, or a reveal running ahead of the words.
         // An estimate is not a problem, but it is not a measurement either, so
         // it gets its own badge rather than hiding among the timed slices.
-        const problems = flags.filter((flag) => flag !== "override" && flag !== "estimated");
+        const problems = flags.filter(
+          (flag) => flag !== "override" && flag !== "estimated" && flag !== "unplaced",
+        );
         const estimatedHere = flags.includes("estimated");
-        const needsBadge = problems.length > 0 || estimatedHere;
+        const unplacedHere = flags.includes("unplaced");
+        const needsBadge = problems.length > 0 || estimatedHere || unplacedHere;
         // A reveal may be shortened until it only just fits, but it must still
         // leave the minimum hold — below that, speeding up cannot fix it.
         const speedTarget = Math.max(MIN_SLICE_ANIMATION, nextStart - start - MIN_SLICE_HOLD);
@@ -589,7 +911,7 @@ function ClipSlices({
                 <DropdownMenuTrigger asChild>
                   <button
                     type="button"
-                    className={`slice-flag${problems.length ? "" : " estimated"}`}
+                    className={`slice-flag${problems.length ? "" : unplacedHere ? " unplaced" : " estimated"}`}
                     style={{ left: percent(start) }}
                     title={`Slice ${slice.number}: ${flags
                       .filter((flag) => flag !== "override")
@@ -598,16 +920,29 @@ function ClipSlices({
                     aria-label={
                       problems.length
                         ? `Slice ${slice.number} timing needs attention`
-                        : `Slice ${slice.number} was placed by estimation`
+                        : unplacedHere
+                          ? `Slice ${slice.number} is not spoken in this scene`
+                          : `Slice ${slice.number} was placed by estimation`
                     }
                     onPointerDown={(event) => event.stopPropagation()}
                     onClick={(event) => event.stopPropagation()}
                   >
-                    {problems.length ? "!" : "≈"}
+                    {problems.length ? "!" : unplacedHere ? "?" : "≈"}
                   </button>
                 </DropdownMenuTrigger>
                 <DropdownMenuContent align="start" side="top" className="slice-flag-menu">
-                  <DropdownMenuLabel>{problems.length ? "Reveal timing" : "Placed by rule"}</DropdownMenuLabel>
+                  <DropdownMenuLabel>
+                    {problems.length
+                      ? "Reveal timing"
+                      : unplacedHere
+                        ? "Not in this scene"
+                        : "Placed by rule"}
+                  </DropdownMenuLabel>
+                  {unplacedHere && (
+                    <DropdownMenuItem disabled>
+                      Its trigger phrase is not spoken while this image is on screen
+                    </DropdownMenuItem>
+                  )}
                   {estimatedHere && (
                     <DropdownMenuItem disabled>
                       Its words were not found, so it was fitted between its neighbours
@@ -2198,24 +2533,148 @@ function Editor() {
   };
 
   /**
-   * Imports borders authored outside the editor. Geometry and order come from
-   * the map; nothing about time does. An invalid map changes nothing at all, so
-   * a bad paste can never leave the image half-sliced.
+   * Imports borders authored outside the editor. Geometry, order and trigger
+   * phrases come from the map; nothing about time does.
+   *
+   * A whole-project bundle is applied in one action: every image it names gets
+   * its own slices, the image clips are put in the bundle's order, and every
+   * affected row is re-timed against the voice. A map that cannot be matched or
+   * parsed changes nothing at all, so a bad paste can never leave the project
+   * half-sliced.
    */
-  const importSliceMap = (text: string): SliceMapReport => {
-    const report = parseSliceMap(text, { fileName: cutsClip?.name });
-    if (report.errors.length > 0 || !cutsClip) return report;
+  // Exporting the whole project: every sliced image in play order, so manual
+  // work can be handed to another chat — or re-imported — without losing the
+  // arrangement. An image with no slices is left out rather than exported as an
+  // empty entry, which a re-import would reject.
+  const copySliceMapProject = useCallback(() => {
+    const images = [...projectRef.current.clips]
+      .filter((clip) => clip.mediaType === "image")
+      .sort((a, b) => a.start - b.start)
+      .map((clip, index) => ({ clip, image: index + 1 }))
+      .filter(({ clip }) => (clip.slices ?? []).length > 0);
+    return serializeSliceMapProject(
+      images.map(({ clip, image }) => ({
+        image,
+        file: clip.name,
+        slices: (clip.slices ?? []).map((slice) => ({
+          order: slice.order,
+          number: slice.number,
+          cue: slice.cue,
+          points: slice.points,
+        })),
+      })),
+    );
+  }, [projectRef]);
 
-    const shapes: SliceShape[] = report.slices.map((slice, index) => ({
-      id: makeId(),
-      number: slice.number ?? index + 1,
-      order: slice.order,
-      points: slice.points.map((point) => ({ x: point.x, y: point.y })),
-      ...(slice.cue ? { cue: slice.cue } : {}),
-    }));
-    applyClipSlices(cutsClip, shapes);
-    setSelectedSliceId(shapes[0]?.id ?? null);
-    return report;
+  const importSliceMap = (text: string): SliceMapReport => {
+    const state = projectRef.current;
+    const openClip = cutsClip;
+    const bundle = parseSliceMapBundle(text);
+    if (bundle.errors.length) {
+      return {
+        slices: [],
+        errors: bundle.errors,
+        warnings: bundle.warnings,
+        space: bundle.space,
+        coverage: 0,
+      };
+    }
+    if (!bundle.images.length) {
+      return {
+        slices: [],
+        errors: [{ path: "map", message: "This map does not describe any image." }],
+        warnings: bundle.warnings,
+        space: bundle.space,
+        coverage: 0,
+      };
+    }
+
+    // A single-image map keeps its old meaning: it lands on the open image.
+    if (bundle.images.length === 1) {
+      if (!openClip) {
+        return {
+          slices: [],
+          errors: [{ path: "map", message: "Open an image in the slicer first." }],
+          warnings: bundle.warnings,
+          space: bundle.space,
+          coverage: 0,
+        };
+      }
+      const entry = bundle.images[0]!;
+      const shapes = slicesFromMap(entry.slices);
+      const applied = applySlicesToClips(state, [{ clip: openClip, shapes }]);
+      commitProject(arrangeImageTrack(applied, openClip.trackId).project);
+      setSelectedSliceId(shapes[0]?.id ?? null);
+      return {
+        slices: entry.slices,
+        errors: [],
+        warnings: [...bundle.warnings, ...entry.warnings],
+        space: entry.space,
+        coverage: entry.coverage,
+      };
+    }
+
+    const imageClips = [...state.clips]
+      .filter((clip) => clip.mediaType === "image")
+      .sort((a, b) => a.start - b.start);
+    const { matches, errors } = matchBundleImages(bundle.images, imageClips);
+    if (errors.length) {
+      return {
+        slices: [],
+        errors,
+        warnings: bundle.warnings,
+        space: bundle.space,
+        coverage: 0,
+      };
+    }
+
+    let next = applySlicesToClips(
+      state,
+      matches.map((match) => ({ clip: match.clip, shapes: slicesFromMap(match.entry.slices) })),
+    );
+
+    const rows = new Set(matches.map((match) => match.clip.trackId));
+    const warnings = [...bundle.warnings];
+    if (rows.size === 1) {
+      const row = matches[0]!.clip.trackId;
+      next = orderImageClips(
+        next,
+        row,
+        matches.map((match) => match.clip.id),
+      );
+      warnings.push({
+        path: "images",
+        message: `Imported ${matches.length} images and arranged them in the map's order.`,
+      });
+    } else {
+      warnings.push({
+        path: "images",
+        message: `Imported ${matches.length} images. They are on different rows, so their order was left alone.`,
+      });
+    }
+
+    // Re-time each affected row against the voice, in the new order.
+    rows.forEach((row) => {
+      next = arrangeImageTrack(next, row).project;
+    });
+    commitProject(next);
+
+    const openMatch = openClip
+      ? matches.find((match) => match.clip.id === openClip.id)
+      : undefined;
+    setSelectedSliceId(
+      openMatch
+        ? (next.clips.find((clip) => clip.id === openClip!.id)?.slices?.[0]?.id ?? null)
+        : null,
+    );
+    const shown = openMatch?.entry ?? matches[0]!.entry;
+    return {
+      slices: shown.slices,
+      errors: [],
+      warnings: [...warnings, ...shown.warnings],
+      space: shown.space,
+      coverage: shown.coverage,
+    };
   };
 
   /**
@@ -2371,119 +2830,43 @@ function Editor() {
   );
 
   /**
-   * Resolves every cue on this image against the narration underneath it and
-   * writes the resulting reveals in one history entry. Cues that are not spoken,
-   * or that belong to another scene, are reported instead of approximated.
+   * Re-times every image on the open scene's row against the voice.
+   *
+   * This is the single alignment path: callers never patch one clip's numbers
+   * by hand. The arrangement grows scenes from their own slices (never from a
+   * neighbour), ripples later images, and re-solves them where their position
+   * moved. Cues that are not spoken while their image is on screen are
+   * reported instead of being given an invented slot.
    */
   const syncCuesToNarration = useCallback(
-    (clip: Clip) => {
-      const narration = narrationForClip(clip, projectRef.current.clips, projectRef.current.tracks);
-      if (!narration) {
+    (clipId: string) => {
+      const current = projectRef.current;
+      const clip = current.clips.find((item) => item.id === clipId);
+      if (!clip || clip.mediaType !== "image") return;
+      if (!narrationForClip(clip, current.clips, current.tracks)) {
         setCueStatus("Add narration audio under this image, then transcribe it.");
         return;
       }
 
-      const ordered = [...(clip.slices ?? [])].sort((a, b) => a.order - b.order);
-      // A scene is as long as the narration that belongs to it. The picture's
-      // natural draw time is only a floor: cues spoken at 12 s must not be
-      // squeezed into a 9 s cut. Growth stops at whatever comes next — the next
-      // clip on this row, or the end of the voice itself.
-      const nextStart = projectRef.current.clips
-        .filter(
-          (item) =>
-            item.trackId === clip.trackId && item.id !== clip.id && item.start > clip.start + 0.001,
-        )
-        .reduce((earliest, item) => Math.min(earliest, item.start), Number.POSITIVE_INFINITY);
-      const ceiling = Math.min(narration.endSeconds, nextStart - clip.start);
-      const maxDuration = Math.max(clip.duration, ceiling);
-      const options = {
-        offsetSeconds: narration.offsetSeconds,
-        clipDuration: clip.duration,
-        maxDuration,
-        candidates: narrationBeats(narration.transcript.words),
-      };
+      const arranged = arrangeImageTrack(current, clip.trackId);
+      if (arranged.project !== current) commitProject(arranged.project);
 
-      // With a script, alignment happens once for the whole scene: the script
-      // text is the source of truth for wording, and the transcript only says
-      // when those words were heard. Without one, fall back to matching each
-      // cue directly against the transcript.
-      const script = (projectRef.current.settings.narrationScript ?? "").trim();
-      const cueBeats = ordered
-        .filter((slice) => (slice.cue ?? "").trim())
-        .map((slice) => ({ id: slice.id, cue: (slice.cue ?? "").trim() }));
-      const alignment = script
-        ? alignScriptToTranscript(script, cueBeats, narration.transcript.words)
-        : null;
-      const result = alignment
-        ? syncSliceBeats(
-            ordered,
-            alignment.beats.map((beat) => ({
-              id: beat.id,
-              cue: beat.cue,
-              anchor: beat.anchor,
-            })),
-            options,
-          )
-        : syncSliceCues(ordered, narration.transcript.words, options);
-
-      // Grow to the voice, or a little past the final reveal if that drawing
-      // runs longer than the words. Never shrink: a scene the user lengthened
-      // by hand stays that way.
-      const needed = Math.max(ceiling, result.spanEnd + SLICE_END_HOLD);
-      const duration = Math.max(
-        clip.duration,
-        Math.round(Math.min(maxDuration, needed) * 100) / 100,
-      );
-      const grows = duration > clip.duration + 0.01;
-
-      if (result.patches.length || grows) {
-        const patches = new Map(result.patches.map((entry) => [entry.id, entry.timing]));
-        commitProject((current) => ({
-          ...current,
-          clips: current.clips.map((item) =>
-            item.id === clip.id
-              ? {
-                  ...item,
-                  ...(grows ? { duration } : {}),
-                  slices: (item.slices ?? []).map((slice) => {
-                    const timing = patches.get(slice.id);
-                    return timing ? { ...slice, timing: { ...slice.timing, ...timing } } : slice;
-                  }),
-                }
-              : item,
-          ),
-        }));
+      const report = arranged.reports.find((entry) => entry.clipId === clipId);
+      if (!report) {
+        setCueStatus("This image has no slices yet.");
+        return;
       }
-
       const parts: string[] = [];
-      const timed = result.patches.length - result.estimated.length;
-      if (timed) parts.push(`${timed} timed`);
-      if (result.estimated.length) {
-        // Explain *why* these were fitted, but never count them twice: they are
-        // already in `estimated`, not in the miss tally.
-        const fitted = new Set(result.estimated);
-        const reasons = alignment
-          ? alignment.misses.filter((miss) => fitted.has(miss.id)).map((miss) => miss.reason)
-          : [];
-        const reason =
-          reasons.length === 1
-            ? reasons[0] === "not-in-script"
-              ? "not in the script"
-              : "not spoken"
-            : null;
-        parts.push(`${result.estimated.length} estimated${reason ? ` (${reason})` : ""}`);
+      if (report.timed) parts.push(`${report.timed} timed`);
+      if (report.estimated) parts.push(`${report.estimated} estimated`);
+      if (report.uncertain) parts.push(`${report.uncertain} uncertain`);
+      if (report.missing) parts.push(`${report.missing} not in this scene`);
+      if (report.noCue) parts.push(`${report.noCue} without a cue`);
+      if (report.clamped) parts.push(`${report.clamped} pushed later`);
+      if (report.grew > 0.01) {
+        parts.push(`scene ${Math.round((clip.duration + report.grew) * 100) / 100}s`);
       }
-      if (alignment?.weak.length) parts.push(`${alignment.weak.length} uncertain`);
-      if (result.missing.length) {
-        parts.push(
-          alignment
-            ? `${result.missing.length} could not be placed`
-            : `${result.missing.length} not in the narration`,
-        );
-      }
-      if (result.noCue.length) parts.push(`${result.noCue.length} without a cue`);
-      if (result.clamped.length) parts.push(`${result.clamped.length} pushed later`);
-      setCueStatus(parts.length ? parts.join(" · ") : "This image has no slices yet.");
+      setCueStatus(parts.length ? parts.join(" · ") : "Every cue already fits.");
     },
     [commitProject],
   );
@@ -2500,7 +2883,7 @@ function Editor() {
       const clip = projectRef.current.clips.find((item) => item.id === clipId);
       if (!clip || clip.mediaType !== "image") return;
       if (!(clip.slices ?? []).some((slice) => (slice.cue ?? "").trim())) return;
-      syncCuesToNarration(clip);
+      syncCuesToNarration(clipId);
     },
     [syncCuesToNarration],
   );
@@ -2560,15 +2943,22 @@ function Editor() {
       return true;
     });
     if (!fresh.length) return;
+    const affected = new Set<string>();
     fresh.forEach((voice) => {
       state.clips.forEach((image) => {
         if (image.mediaType !== "image") return;
         if (!(image.slices ?? []).some((slice) => (slice.cue ?? "").trim())) return;
         if (narrationForClip(image, state.clips, state.tracks)?.clipId !== voice.id) return;
-        syncCuesToNarration(image);
+        affected.add(image.trackId);
       });
     });
-  }, [project.clips, syncCuesToNarration]);
+    if (!affected.size) return;
+    let next = state;
+    affected.forEach((trackId) => {
+      next = arrangeImageTrack(next, trackId).project;
+    });
+    if (next !== state) commitProject(next);
+  }, [project.clips, commitProject]);
 
   /** Turns a finished boundary drag into authored timing on the clip. */
   const applySliceDrag = useCallback(
@@ -3928,7 +4318,7 @@ function Editor() {
                     <button
                       type="button"
                       className="cue-sync"
-                      onClick={() => syncCuesToNarration(selectedClip)}
+                      onClick={() => syncCuesToNarration(selectedClip.id)}
                     >
                       <RefreshCw size={11} /> Sync to narration
                     </button>
@@ -4503,6 +4893,7 @@ function Editor() {
           onCreate={addSlice}
           onChangePoints={changeSlicePoints}
           onImportMap={importSliceMap}
+          onCopyProject={copySliceMapProject}
           onReorder={reorderSlice}
           onDelete={deleteSlice}
           onClear={clearSlices}

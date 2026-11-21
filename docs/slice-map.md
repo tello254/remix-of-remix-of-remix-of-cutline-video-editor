@@ -17,11 +17,20 @@ Open the slicer on an image, expand **Slice map**, paste the JSON and press
 **Import map**. The right-hand list, the numbering on the image, the timeline
 bands and undo all behave exactly as if you had drawn those polygons by hand.
 
+A pasted **bundle** is applied as a whole project, not just to the open image:
+every image it describes receives its own slices, matched by the `file` title
+(`john-and-the-bully.png` belongs to that image wherever it sits), and the image
+clips are then put in the bundle's order on their row. The whole thing — slices,
+order and timing — is one undo step.
+
 **Copy current** writes the slices on the open image back out in this same
 format — including the image number, file name, slice numbers and trigger
-phrases. Use it to reuse a layout on a second image with the same composition,
-to hand a working example to a model, or as a snapshot of slicing you did by
-hand.
+phrases. **Copy all images** does the same for every sliced image in the
+project, in play order, as one bundle. That export is exactly what **Import
+map** reads, so a project can be re-imported, reordered or handed on without
+losing the arrangement. Use it to reuse a layout on a second image with the same
+composition, to hand a working example to a model, or as a snapshot of slicing
+you did by hand.
 
 Import is **all or nothing**. If any slice fails validation, the report lists the
 problems with the JSON path that caused them (`$[1].points[2]`) and the image
@@ -96,9 +105,16 @@ a larger bundle without preprocessing:
 | `{ "scene": { "beats": [ … ] } }` | one scene |
 | `{ "scenes": [ … ] }` | the first scene that has slices or beats |
 
-When a bundle describes several images, Cutline imports the entry whose `file`
-(or `name`) matches the image that is open. If none matches, the first image is
-used and the report says how many images the map contained.
+When a bundle describes several images, Cutline imports **all of them** in one
+action. Each entry is matched to an image clip by its `file` (or `name`, or
+`title`), ignoring folders, extensions, case and punctuation, so
+`john-and-the-bully.png` finds `scene_01_john_and_the_bully.png`. If a title is
+absent or ambiguous, the entry's `image` number (its play position), then the
+array position, decides. The matched clips are then arranged in the bundle's
+order on their row.
+
+An entry that cannot be matched rejects the whole import, because landing a map
+on the wrong picture is worse than importing nothing.
 
 ### number
 
@@ -177,17 +193,26 @@ later** — never silently moved.
 
 ### Scene length
 
-The image grows to its narration. A picture the engine can draw in 9 seconds
-keeps its 9-second drawing time, but the scene itself lasts as long as the voice
-under it: a cue spoken at 20 seconds is revealed at 20 seconds, not squeezed
-into the first 9. Growth stops at whatever comes next — the next clip on the row,
-or the end of the voice — so a scene can never swallow its neighbour.
+The slices decide how long an image clip lasts. The picture's natural draw time
+is only a floor: a scene ends at its last reveal plus the end hold, so a cue
+spoken at 20 seconds is revealed at 20 seconds instead of being squeezed into a
+9-second picture.
+
+**A scene is never capped by the next clip.** When it grows into the image after
+it, that image — and everything after it on the row — is pushed later and
+re-timed against its new position. Images are containers for slices, and slices
+are pinned to the voice, so the row follows the narration rather than the
+narration being trimmed to fit the row.
 
 Within that longer scene a reveal keeps the engine's natural paint time (about
 1.2 s; see `SLICER_PAINT_TICKS`). Everything left over between one reveal's end
 and the next reveal's start becomes **hold**, which is why a long narration makes
 pictures rest on screen instead of drawing slowly. Scenes are never shrunk
-automatically: dragging a boundary or trimming the clip still means what it says.
+automatically.
+
+A cue whose words are not spoken while its image is on screen gets **no reveal**
+and a `?` badge. It is not given a guessed uniform slot ahead of the cues that
+were measured — that is what used to make reveals paint wherever they liked.
 
 ### Estimation
 
@@ -233,6 +258,7 @@ them but the recording does not.
 | --- | --- |
 | yellow `!` | the schedule had to give: pushed later, tight, or running early |
 | blue `≈` | placed by rule between its neighbours, not by its own words |
+| grey `?` | its trigger phrase is not spoken in this scene, so it has no reveal |
 | purple band | the start was moved by hand; that is visible, so it gets no badge |
 
 ## Validation
